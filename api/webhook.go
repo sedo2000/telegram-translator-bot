@@ -61,7 +61,7 @@ type TelegramResponse struct {
 }
 
 type MediaItem struct {
-	Type   string `json:"type"` // "photo" أو "video"
+	Type   string `json:"type"`
 	FileID string `json:"file_id"`
 }
 
@@ -71,13 +71,11 @@ type InputMedia struct {
 	Caption string `json:"caption,omitempty"`
 }
 
-// هيكل القناة المحفوظة
 type Channel struct {
 	ID    string `json:"id"`
 	Title string `json:"title"`
 }
 
-// هيكل المسودة الحالية للنشر
 type Draft struct {
 	Media            []MediaItem
 	MediaGroupID     string
@@ -85,7 +83,6 @@ type Draft struct {
 	LastBotMessageID int
 }
 
-// الذاكرة المؤقتة لتدفق العمل
 var (
 	userChannels = make(map[int64][]Channel)
 	userDrafts   = make(map[int64]*Draft)
@@ -105,19 +102,16 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 
-	// 1. التعامل مع الضغط على الأزرار الشفافة
 	if update.CallbackQuery != nil {
 		handleCallbackQuery(token, update.CallbackQuery)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// 2. التعامل مع الرسائل الواردة
 	if update.Message != nil {
 		chatID := update.Message.Chat.ID
 		text := update.Message.Text
 
-		// أمر البداية /start
 		if text == "/start" {
 			userName := "المستخدم"
 			if update.Message.From != nil && update.Message.From.FirstName != "" {
@@ -128,14 +122,13 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				"1️⃣ قم برفع البوت كمشرف (Admin) في قناتك مع صلاحيات نشر الرسائل.\n"+
 				"2️⃣ أرسل معرف قناتك العامة مع ( الـ @) أو ايدي القناة الخاصة (-100xxxx) لإضافتها في البوت.\n"+
 				"3️⃣ يمكنك إرسال عدة قنوات وسيظهر لك البوت قائمة بأسمائها عند كل عملية نشر!\n"+
-				"4️⃣ يمكنك إرسال نصوص، صور، أو فيديوهات (منفردة أو ألبومات) للنشر بشكل مباشر.", userName)
+				"4️⃣ يمكنك إرسال نصوص، صور، أو فيديوهات للنشر بشكل مباشر.", userName)
 
 			sendTelegramMessage(token, chatID, welcomeMsg, nil)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// إضافة قناة جديدة
 		if strings.HasPrefix(text, "@") || strings.HasPrefix(text, "-100") {
 			chTitle, err := fetchChannelTitle(token, text)
 			if err != nil {
@@ -148,7 +141,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// تحديد نوع الوسائط المرفوقة (صورة أو فيديو)
 		var currentMedia *MediaItem
 		if len(update.Message.Photo) > 0 {
 			photoID := update.Message.Photo[len(update.Message.Photo)-1].FileID
@@ -157,7 +149,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			currentMedia = &MediaItem{Type: "video", FileID: update.Message.Video.FileID}
 		}
 
-		// التعامل مع استلام الوسائط (صور / فيديوهات)
 		if currentMedia != nil {
 			mediaGroupID := update.Message.MediaGroupID
 			draft, exists := userDrafts[chatID]
@@ -189,7 +180,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// التعامل مع النصوص (الكابشن أو المنشورات النصية)
 		if text != "" {
 			draft, hasDraft := userDrafts[chatID]
 
@@ -267,7 +257,6 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 			return
 		}
 
-		// عملية النشر حسب نوع الوسائط والعدد
 		if len(draft.Media) > 1 {
 			publishMediaGroupToChannel(token, targetChannel.ID, draft.Media, draft.Caption)
 		} else if len(draft.Media) == 1 {
@@ -425,24 +414,6 @@ func publishMediaGroupToChannel(token, channelID string, mediaItems []MediaItem,
 	}
 	jsonBody, _ := json.Marshal(payload)
 	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
-
-	// نظراً لأن تليجرام يحظر إضافة أزرار داخل الألبوم مباشرة، يتم إرسال زر الترجمة كرسالة ملحقة بالألبوم
-	if caption != "" {
-		btnPayload := map[string]interface{}{
-			"chat_id": channelID,
-			"text":    "🌐 ترجمة الكابشن المرفق بالألبوم:",
-			"reply_markup": map[string]interface{}{
-				"inline_keyboard": [][]map[string]interface{}{
-					{
-						{"text": "Translate", "callback_data": "translate", "style": "primary"},
-					},
-				},
-			},
-		}
-		btnJson, _ := json.Marshal(btnPayload)
-		sendMsgURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-		http.Post(sendMsgURL, "application/json", bytes.NewBuffer(btnJson))
-	}
 }
 
 func deleteTelegramMessage(token string, chatID int64, messageID int) {
