@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 type Update struct {
@@ -86,6 +88,9 @@ type Draft struct {
 var (
 	userChannels = make(map[int64][]Channel)
 	userDrafts   = make(map[int64]*Draft)
+
+	// عميل HTTP مشترك بمهلة زمنية محددة، يُستخدم في كل الطلبات الخارجية
+	httpClient = &http.Client{Timeout: 8 * time.Second}
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
@@ -336,14 +341,14 @@ func askSelectChannel(token string, chatID int64, promptMsg string) {
 
 func fetchChannelTitle(token, channelID string) (string, error) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getChat?chat_id=%s", token, url.QueryEscape(channelID))
-	resp, err := http.Get(apiURL)
+	resp, err := httpClient.Get(apiURL)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	var result TelegramResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err || !result.OK {
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || !result.OK {
 		return "", fmt.Errorf("channel not found")
 	}
 
@@ -364,7 +369,7 @@ func publishTextToChannel(token, channelID, text string) {
 		},
 	}
 	jsonBody, _ := json.Marshal(payload)
-	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
 func publishPhotoToChannel(token, channelID, photoID, caption string) {
@@ -382,7 +387,7 @@ func publishPhotoToChannel(token, channelID, photoID, caption string) {
 		},
 	}
 	jsonBody, _ := json.Marshal(payload)
-	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
 func publishVideoToChannel(token, channelID, videoID, caption string) {
@@ -400,7 +405,7 @@ func publishVideoToChannel(token, channelID, videoID, caption string) {
 		},
 	}
 	jsonBody, _ := json.Marshal(payload)
-	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
 func publishMediaGroupToChannel(token, channelID string, mediaItems []MediaItem, caption string) {
@@ -422,7 +427,7 @@ func publishMediaGroupToChannel(token, channelID string, mediaItems []MediaItem,
 		"media":   mediaList,
 	}
 	jsonBody, _ := json.Marshal(payload)
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return
 	}
@@ -452,7 +457,7 @@ func publishMediaGroupToChannel(token, channelID string, mediaItems []MediaItem,
 		}
 		btnJson, _ := json.Marshal(btnPayload)
 		sendMsgURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-		http.Post(sendMsgURL, "application/json", bytes.NewBuffer(btnJson))
+		httpClient.Post(sendMsgURL, "application/json", bytes.NewBuffer(btnJson))
 	}
 }
 
@@ -466,7 +471,7 @@ func deleteTelegramMessage(token string, chatID int64, messageID int) {
 		"message_id": messageID,
 	}
 	jsonBody, _ := json.Marshal(payload)
-	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
 func sendTelegramMessage(token string, chatID int64, text string, keyboard [][]map[string]interface{}) int {
@@ -484,7 +489,7 @@ func sendTelegramMessage(token string, chatID int64, text string, keyboard [][]m
 	}
 
 	jsonBody, _ := json.Marshal(payload)
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return 0
 	}
@@ -513,7 +518,7 @@ func answerCallback(token, callbackID, text string, showAlert bool) {
 		"show_alert":        showAlert,
 	}
 	jsonBody, _ := json.Marshal(payload)
-	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
 func cleanString(s string) string {
@@ -524,22 +529,47 @@ func cleanString(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// translateToArabic يترجم النص المُعطى إلى العربية عبر MyMemory API.
+// تم إصلاح المشاكل التالية مقارنة بالنسخة السابقة:
+//  1. إضافة مهلة زمنية (timeout) للطلب حتى لا يتعلق ولا يفشل بصمت.
+//  2. اقتطاع النصوص الطويلة لأن MyMemory يرفض النصوص الأطول من ~500 حرف.
+//  3. التحقق الفعلي من responseStatus بدل الاكتفاء بوجود نص مُترجم،
+//     لأن MyMemory قد يعيد رسالة خطأ (تجاوز الحد اليومي) داخل translatedText نفسه.
+//  4. تسجيل الأخطاء عبر log.Printf بحيث تظهر في لوجز Vercel لتشخيص أي عطل لاحقاً.
 func translateToArabic(text string) string {
 	clean := cleanString(text)
 	if clean == "" {
 		return "لا يوجد نص محدد للترجمة."
 	}
 
-	apiURL := fmt.Sprintf("https://api.mymemory.translated.net/get?q=%s&langpair=en|ar", url.QueryEscape(clean))
+	// MyMemory يرفض/يقطع النصوص الطويلة، لذا نحدّها احتياطاً
+	runes := []rune(clean)
+	if len(runes) > 490 {
+		clean = string(runes[:490])
+	}
 
-	resp, err := http.Get(apiURL)
+	// ملاحظة: يمكن إضافة "&de=your-email@example.com" لرفع الحد اليومي
+	// من 5000 كلمة إلى ما يقارب 50000 كلمة لكل IP.
+	apiURL := fmt.Sprintf(
+		"https://api.mymemory.translated.net/get?q=%s&langpair=en|ar",
+		url.QueryEscape(clean),
+	)
+
+	resp, err := httpClient.Get(apiURL)
 	if err != nil {
+		log.Printf("translateToArabic: request error: %v", err)
 		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
+		log.Printf("translateToArabic: read error: %v", err)
+		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("translateToArabic: bad HTTP status %d, body: %s", resp.StatusCode, string(body))
 		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
 	}
 
@@ -547,11 +577,25 @@ func translateToArabic(text string) string {
 		ResponseData struct {
 			TranslatedText string `json:"translatedText"`
 		} `json:"responseData"`
-		ResponseStatus int `json:"responseStatus"`
+		ResponseStatus interface{} `json:"responseStatus"` // قد يأتي كرقم أو كنص حسب حالة الرد
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("translateToArabic: json unmarshal error: %v, body: %s", err, string(body))
 		return "تعذرت ترجمة النص."
+	}
+
+	statusOK := false
+	switch v := result.ResponseStatus.(type) {
+	case float64:
+		statusOK = v == 200
+	case string:
+		statusOK = v == "200"
+	}
+
+	if !statusOK {
+		log.Printf("translateToArabic: mymemory returned non-200 status, body: %s", string(body))
+		return "تعذرت ترجمة النص (قد يكون تم تجاوز الحد المسموح للترجمة اليوم)."
 	}
 
 	if result.ResponseData.TranslatedText != "" {
