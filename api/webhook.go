@@ -11,7 +11,6 @@ import (
 	"strings"
 )
 
-// هياكل بيانات تليجرام
 type Update struct {
 	UpdateID      int            `json:"update_id"`
 	Message       *Message       `json:"message"`
@@ -209,14 +208,18 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 	data := cq.Data
 
 	if data == "translate" {
-		textToTranslate := cq.Message.Text
-		if textToTranslate == "" || textToTranslate == "ㅤ" {
-			textToTranslate = cq.Message.Caption
-		}
+		var textToTranslate string
 
-		// إذا كان الزر أسفل ألبوم صور عبر الـ Reply
-		if (textToTranslate == "" || textToTranslate == "ㅤ") && cq.Message.ReplyToMessage != nil {
-			textToTranslate = cq.Message.ReplyToMessage.Caption
+		if cleanString(cq.Message.Text) != "" {
+			textToTranslate = cq.Message.Text
+		} else if cleanString(cq.Message.Caption) != "" {
+			textToTranslate = cq.Message.Caption
+		} else if cq.Message.ReplyToMessage != nil {
+			if cleanString(cq.Message.ReplyToMessage.Caption) != "" {
+				textToTranslate = cq.Message.ReplyToMessage.Caption
+			} else if cleanString(cq.Message.ReplyToMessage.Text) != "" {
+				textToTranslate = cq.Message.ReplyToMessage.Text
+			}
 		}
 
 		translatedText := translateToArabic(textToTranslate)
@@ -433,7 +436,6 @@ func publishMediaGroupToChannel(token, channelID string, mediaItems []MediaItem,
 	}
 	json.NewDecoder(resp.Body).Decode(&groupRes)
 
-	// إضافة زر الترجمة أسفل الألبوم كرمز شفاف مرتبط بالألبوم
 	if caption != "" && len(groupRes.Result) > 0 {
 		firstMsgID := groupRes.Result[0].MessageID
 		btnPayload := map[string]interface{}{
@@ -499,6 +501,11 @@ func sendTelegramMessage(token string, chatID int64, text string, keyboard [][]m
 }
 
 func answerCallback(token, callbackID, text string, showAlert bool) {
+	runes := []rune(text)
+	if len(runes) > 200 {
+		text = string(runes[:197]) + "..."
+	}
+
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", token)
 	payload := map[string]interface{}{
 		"callback_query_id": callbackID,
@@ -509,18 +516,41 @@ func answerCallback(token, callbackID, text string, showAlert bool) {
 	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
+func cleanString(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "ㅤ", "")
+	s = strings.ReplaceAll(s, "\u200b", "")
+	s = strings.ReplaceAll(s, "\u2800", "")
+	return strings.TrimSpace(s)
+}
+
 func translateToArabic(text string) string {
-	if text == "" {
-		return "لا يوجد نص للترجمة."
+	clean := cleanString(text)
+	if clean == "" {
+		return "لا يوجد نص محدد للترجمة."
 	}
-	apiURL := fmt.Sprintf("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=%s", url.QueryEscape(text))
-	resp, err := http.Get(apiURL)
+
+	apiURL := fmt.Sprintf("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=%s", url.QueryEscape(clean))
+
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return "حدث خطأ أثناء الاتصال بخدمة الترجمة."
+		return "حدث خطأ في طلب الترجمة."
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "حدث خطأ أثناء الاتصال بالترجمة."
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
+	}
+
 	var result []interface{}
 	if err := json.Unmarshal(body, &result); err != nil || len(result) == 0 {
 		return "تعذرت ترجمة النص."
@@ -535,7 +565,7 @@ func translateToArabic(text string) string {
 				}
 			}
 		}
-		if fullTranslation != "" {
+		if cleanString(fullTranslation) != "" {
 			return fullTranslation
 		}
 	}
