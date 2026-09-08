@@ -343,7 +343,7 @@ func fetchChannelTitle(token, channelID string) (string, error) {
 	defer resp.Body.Close()
 
 	var result TelegramResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || !result.OK {
+	if err := json.NewDecoder(resp.Body).Decode(&result); err || !result.OK {
 		return "", fmt.Errorf("channel not found")
 	}
 
@@ -530,19 +530,11 @@ func translateToArabic(text string) string {
 		return "لا يوجد نص محدد للترجمة."
 	}
 
-	apiURL := fmt.Sprintf("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=%s", url.QueryEscape(clean))
+	apiURL := fmt.Sprintf("https://api.mymemory.translated.net/get?q=%s&langpair=en|ar", url.QueryEscape(clean))
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	resp, err := http.Get(apiURL)
 	if err != nil {
-		return "حدث خطأ في طلب الترجمة."
-	}
-
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "حدث خطأ أثناء الاتصال بالترجمة."
+		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
 	}
 	defer resp.Body.Close()
 
@@ -551,23 +543,19 @@ func translateToArabic(text string) string {
 		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
 	}
 
-	var result []interface{}
-	if err := json.Unmarshal(body, &result); err != nil || len(result) == 0 {
+	var result struct {
+		ResponseData struct {
+			TranslatedText string `json:"translatedText"`
+		} `json:"responseData"`
+		ResponseStatus int `json:"responseStatus"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
 		return "تعذرت ترجمة النص."
 	}
 
-	if inner, ok := result[0].([]interface{}); ok {
-		var fullTranslation string
-		for _, elem := range inner {
-			if item, ok := elem.([]interface{}); ok && len(item) > 0 {
-				if translatedSegment, ok := item[0].(string); ok {
-					fullTranslation += translatedSegment
-				}
-			}
-		}
-		if cleanString(fullTranslation) != "" {
-			return fullTranslation
-		}
+	if result.ResponseData.TranslatedText != "" {
+		return result.ResponseData.TranslatedText
 	}
 
 	return "تعذرت ترجمة النص."
