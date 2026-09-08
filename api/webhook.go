@@ -29,11 +29,16 @@ type Message struct {
 	From         *User       `json:"from"`
 	Text         string      `json:"text"`
 	Photo        []PhotoSize `json:"photo"`
+	Video        *Video      `json:"video"`
 	Caption      string      `json:"caption"`
 	MediaGroupID string      `json:"media_group_id"`
 }
 
 type PhotoSize struct {
+	FileID string `json:"file_id"`
+}
+
+type Video struct {
 	FileID string `json:"file_id"`
 }
 
@@ -55,7 +60,12 @@ type TelegramResponse struct {
 	Result Chat `json:"result"`
 }
 
-type InputMediaPhoto struct {
+type MediaItem struct {
+	Type   string `json:"type"` // "photo" أو "video"
+	FileID string `json:"file_id"`
+}
+
+type InputMedia struct {
 	Type    string `json:"type"`
 	Media   string `json:"media"`
 	Caption string `json:"caption,omitempty"`
@@ -69,7 +79,7 @@ type Channel struct {
 
 // هيكل المسودة الحالية للنشر
 type Draft struct {
-	Photos           []string
+	Media            []MediaItem
 	MediaGroupID     string
 	Caption          string
 	LastBotMessageID int
@@ -118,7 +128,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				"1️⃣ قم برفع البوت كمشرف (Admin) في قناتك مع صلاحيات نشر الرسائل.\n"+
 				"2️⃣ أرسل معرف قناتك العامة مع ( الـ @) أو ايدي القناة الخاصة (-100xxxx) لإضافتها في البوت.\n"+
 				"3️⃣ يمكنك إرسال عدة قنوات وسيظهر لك البوت قائمة بأسمائها عند كل عملية نشر!\n"+
-				"4️⃣ يمكنك إرسال نصوص أو صور للنشر بشكل مباشر.", userName)
+				"4️⃣ يمكنك إرسال نصوص، صور، أو فيديوهات (منفردة أو ألبومات) للنشر بشكل مباشر.", userName)
 
 			sendTelegramMessage(token, chatID, welcomeMsg, nil)
 			w.WriteHeader(http.StatusOK)
@@ -138,22 +148,27 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// التعامل مع رفع الصورة أو ألبوم الصور (Media Group)
+		// تحديد نوع الوسائط المرفوقة (صورة أو فيديو)
+		var currentMedia *MediaItem
 		if len(update.Message.Photo) > 0 {
 			photoID := update.Message.Photo[len(update.Message.Photo)-1].FileID
-			mediaGroupID := update.Message.MediaGroupID
+			currentMedia = &MediaItem{Type: "photo", FileID: photoID}
+		} else if update.Message.Video != nil {
+			currentMedia = &MediaItem{Type: "video", FileID: update.Message.Video.FileID}
+		}
 
+		// التعامل مع استلام الوسائط (صور / فيديوهات)
+		if currentMedia != nil {
+			mediaGroupID := update.Message.MediaGroupID
 			draft, exists := userDrafts[chatID]
 
-			// إذا كانت مجموعة صور جديدة أو صورة منفردة جديدة
 			if !exists || draft.MediaGroupID != mediaGroupID || mediaGroupID == "" {
-				// مسح الرسالة السابقة إن وجدت
 				if exists && draft.LastBotMessageID != 0 {
 					deleteTelegramMessage(token, chatID, draft.LastBotMessageID)
 				}
 
 				draft = &Draft{
-					Photos:       []string{photoID},
+					Media:        []MediaItem{*currentMedia},
 					MediaGroupID: mediaGroupID,
 				}
 				userDrafts[chatID] = draft
@@ -164,28 +179,26 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 						{"text": "❌ إلغاء", "callback_data": "action_cancel", "style": "danger"},
 					},
 				}
-				msgID := sendTelegramMessage(token, chatID, "📸 تم استلام المحتوى!\nهل تريد إضافة نص (كابشن) أسفل المحتوى؟\n\n- أرسل النص الآن كرسالة عادية.\n- أو اضغط على (تخطي) للنشر بدون نص.", buttons)
+				msgID := sendTelegramMessage(token, chatID, "📸/🎥 تم استلام المحتوى!\nهل تريد إضافة نص (كابشن) أسفل المحتوى؟\n\n- أرسل النص الآن كرسالة عادية.\n- أو اضغط على (تخطي) للنشر بدون نص.", buttons)
 				draft.LastBotMessageID = msgID
 			} else {
-				// إضافة الصور الإضافية بنفس الألبوم دون تكرار إرسال الأزرار
-				draft.Photos = append(draft.Photos, photoID)
+				draft.Media = append(draft.Media, *currentMedia)
 			}
 
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// التعامل مع النصوص
+		// التعامل مع النصوص (الكابشن أو المنشورات النصية)
 		if text != "" {
 			draft, hasDraft := userDrafts[chatID]
 
-			// مسح رسالة الأزرار السابقة عند إرسال المستخدم لنص الكابشن
 			if hasDraft && draft.LastBotMessageID != 0 {
 				deleteTelegramMessage(token, chatID, draft.LastBotMessageID)
 				draft.LastBotMessageID = 0
 			}
 
-			if hasDraft && len(draft.Photos) > 0 && draft.Caption == "" {
+			if hasDraft && len(draft.Media) > 0 && draft.Caption == "" {
 				draft.Caption = text
 				askConfirmation(token, chatID, "هل تريد نشر المحتوى مع النص كـ كابشن؟")
 				w.WriteHeader(http.StatusOK)
@@ -204,7 +217,6 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 	chatID := cq.From.ID
 	data := cq.Data
 
-	// حذف الرسالة/الأزرار السابقة فور الضغط على أي زر
 	deleteTelegramMessage(token, chatID, cq.Message.MessageID)
 
 	if data == "translate" {
@@ -255,10 +267,16 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 			return
 		}
 
-		if len(draft.Photos) > 1 {
-			publishMediaGroupToChannel(token, targetChannel.ID, draft.Photos, draft.Caption)
-		} else if len(draft.Photos) == 1 {
-			publishPhotoToChannel(token, targetChannel.ID, draft.Photos[0], draft.Caption)
+		// عملية النشر حسب نوع الوسائط والعدد
+		if len(draft.Media) > 1 {
+			publishMediaGroupToChannel(token, targetChannel.ID, draft.Media, draft.Caption)
+		} else if len(draft.Media) == 1 {
+			item := draft.Media[0]
+			if item.Type == "photo" {
+				publishPhotoToChannel(token, targetChannel.ID, item.FileID, draft.Caption)
+			} else if item.Type == "video" {
+				publishVideoToChannel(token, targetChannel.ID, item.FileID, draft.Caption)
+			}
 		} else {
 			publishTextToChannel(token, targetChannel.ID, draft.Caption)
 		}
@@ -369,18 +387,36 @@ func publishPhotoToChannel(token, channelID, photoID, caption string) {
 	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
-func publishMediaGroupToChannel(token, channelID string, photos []string, caption string) {
+func publishVideoToChannel(token, channelID, videoID, caption string) {
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendVideo", token)
+	payload := map[string]interface{}{
+		"chat_id": channelID,
+		"video":   videoID,
+		"caption": caption,
+		"reply_markup": map[string]interface{}{
+			"inline_keyboard": [][]map[string]interface{}{
+				{
+					{"text": "Translate", "callback_data": "translate", "style": "primary"},
+				},
+			},
+		},
+	}
+	jsonBody, _ := json.Marshal(payload)
+	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+}
+
+func publishMediaGroupToChannel(token, channelID string, mediaItems []MediaItem, caption string) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMediaGroup", token)
-	var mediaList []InputMediaPhoto
-	for i, photoID := range photos {
-		item := InputMediaPhoto{
-			Type:  "photo",
-			Media: photoID,
+	var mediaList []InputMedia
+	for i, item := range mediaItems {
+		m := InputMedia{
+			Type:  item.Type,
+			Media: item.FileID,
 		}
 		if i == 0 && caption != "" {
-			item.Caption = caption
+			m.Caption = caption
 		}
-		mediaList = append(mediaList, item)
+		mediaList = append(mediaList, m)
 	}
 
 	payload := map[string]interface{}{
@@ -389,6 +425,24 @@ func publishMediaGroupToChannel(token, channelID string, photos []string, captio
 	}
 	jsonBody, _ := json.Marshal(payload)
 	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+
+	// نظراً لأن تليجرام يحظر إضافة أزرار داخل الألبوم مباشرة، يتم إرسال زر الترجمة كرسالة ملحقة بالألبوم
+	if caption != "" {
+		btnPayload := map[string]interface{}{
+			"chat_id": channelID,
+			"text":    "🌐 ترجمة الكابشن المرفق بالألبوم:",
+			"reply_markup": map[string]interface{}{
+				"inline_keyboard": [][]map[string]interface{}{
+					{
+						{"text": "Translate", "callback_data": "translate", "style": "primary"},
+					},
+				},
+			},
+		}
+		btnJson, _ := json.Marshal(btnPayload)
+		sendMsgURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+		http.Post(sendMsgURL, "application/json", bytes.NewBuffer(btnJson))
+	}
 }
 
 func deleteTelegramMessage(token string, chatID int64, messageID int) {
