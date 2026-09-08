@@ -24,14 +24,15 @@ type User struct {
 }
 
 type Message struct {
-	MessageID    int         `json:"message_id"`
-	Chat         Chat        `json:"chat"`
-	From         *User       `json:"from"`
-	Text         string      `json:"text"`
-	Photo        []PhotoSize `json:"photo"`
-	Video        *Video      `json:"video"`
-	Caption      string      `json:"caption"`
-	MediaGroupID string      `json:"media_group_id"`
+	MessageID      int         `json:"message_id"`
+	Chat           Chat        `json:"chat"`
+	From           *User       `json:"from"`
+	Text           string      `json:"text"`
+	Photo          []PhotoSize `json:"photo"`
+	Video          *Video      `json:"video"`
+	Caption        string      `json:"caption"`
+	MediaGroupID   string      `json:"media_group_id"`
+	ReplyToMessage *Message    `json:"reply_to_message"`
 }
 
 type PhotoSize struct {
@@ -207,18 +208,23 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 	chatID := cq.From.ID
 	data := cq.Data
 
-	deleteTelegramMessage(token, chatID, cq.Message.MessageID)
-
 	if data == "translate" {
 		textToTranslate := cq.Message.Text
-		if textToTranslate == "" {
+		if textToTranslate == "" || textToTranslate == "ㅤ" {
 			textToTranslate = cq.Message.Caption
+		}
+
+		// إذا كان الزر أسفل ألبوم صور عبر الـ Reply
+		if (textToTranslate == "" || textToTranslate == "ㅤ") && cq.Message.ReplyToMessage != nil {
+			textToTranslate = cq.Message.ReplyToMessage.Caption
 		}
 
 		translatedText := translateToArabic(textToTranslate)
 		answerCallback(token, cq.ID, translatedText, true)
 		return
 	}
+
+	deleteTelegramMessage(token, chatID, cq.Message.MessageID)
 
 	if data == "action_skip_caption" {
 		askConfirmation(token, chatID, "هل تريد النشر بدون نص؟")
@@ -413,7 +419,39 @@ func publishMediaGroupToChannel(token, channelID string, mediaItems []MediaItem,
 		"media":   mediaList,
 	}
 	jsonBody, _ := json.Marshal(payload)
-	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var groupRes struct {
+		OK     bool `json:"ok"`
+		Result []struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	json.NewDecoder(resp.Body).Decode(&groupRes)
+
+	// إضافة زر الترجمة أسفل الألبوم كرمز شفاف مرتبط بالألبوم
+	if caption != "" && len(groupRes.Result) > 0 {
+		firstMsgID := groupRes.Result[0].MessageID
+		btnPayload := map[string]interface{}{
+			"chat_id":             channelID,
+			"text":                "ㅤ",
+			"reply_to_message_id": firstMsgID,
+			"reply_markup": map[string]interface{}{
+				"inline_keyboard": [][]map[string]interface{}{
+					{
+						{"text": "Translate", "callback_data": "translate", "style": "primary"},
+					},
+				},
+			},
+		}
+		btnJson, _ := json.Marshal(btnPayload)
+		sendMsgURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+		http.Post(sendMsgURL, "application/json", bytes.NewBuffer(btnJson))
+	}
 }
 
 func deleteTelegramMessage(token string, chatID int64, messageID int) {
