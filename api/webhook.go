@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// هياكل بيانات تليجرام (Telegram Update Structures)
+// هياكل تليجرام
 type Update struct {
 	UpdateID      int            `json:"update_id"`
 	Message       *Message       `json:"message"`
@@ -30,10 +30,14 @@ type Chat struct {
 type CallbackQuery struct {
 	ID      string   `json:"id"`
 	Data    string   `json:"data"`
-	Message *Message `json:"message"`
+	Message *Message `json:"message"` // للحصول على النص الأصلي للرسالة
 }
 
-// الدالة الرئيسية التي تستقبل طلبات الـ Webhook على Vercel
+// ذاكرة عشوائية لحفظ القنوات لكل مستخدم بدون قاعدة بيانات
+// ملاحظة: بما أن Vercel تعمل بنظام Serverless، قد يتم تفريغ هذه الذاكرة إذا توقف البوت عن العمل لفترة
+var userChannels = make(map[int64]string)
+
+// دالة الويب هوك الرئيسية
 func Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -47,42 +51,75 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	targetChannel := os.Getenv("TARGET_CHANNEL") // معرف أو معرف معرف القناة مثل @channelName أو -100xxxxxxxxxx
 
-	// 1. التعامل مع الضغط على زر الترجمة (Callback Query)
+	// 1. التعامل مع الضغط على زر الترجمة
 	if update.CallbackQuery != nil {
 		handleCallbackQuery(token, update.CallbackQuery)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// 2. التعامل مع الرسائل الواردة إلى البوت
+	// 2. التعامل مع الرسائل الواردة
 	if update.Message != nil && update.Message.Text != "" {
 		text := update.Message.Text
+		chatID := update.Message.Chat.ID
 
-		// أمر تعريفي لتحديد القناة أو التعامل مع الأوامر
-		if strings.HasPrefix(text, "/setchannel") {
-			parts := strings.SplitN(text, " ", 2)
-			if len(parts) == 2 {
-				// يمكنك حفظ القناة في قاعدة بيانات، هنا كمثال نرسل تأكيد للمستخدم
-				sendTelegramMessage(token, update.Message.Chat.ID, "تم استقبال القناة: "+parts[1])
-			}
+		// أ. رسالة الترحيب
+		if text == "/start" {
+			welcomeMsg := "مرحباً بك في بوت النشر والترجمة! 🤖\n\n" +
+				"أولاً: قم برفع البوت كمشرف (Admin) في قناتك مع صلاحيات (نشر الرسائل).\n" +
+				"ثانياً: أرسل لي معرف القناة:\n" +
+				"- إذا كانت عامة: أرسل المعرف مسبوقاً بـ @ (مثال: @MyChannel)\n" +
+				"- إذا كانت خاصة: أرسل رابط الدعوة الخاص بها لنتعرف عليها."
+			sendTelegramMessage(token, chatID, welcomeMsg)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// نشر النص المرسل إلى القناة العامة أو الخاصة مع زر Translate
-		publishToChannel(token, targetChannel, text)
+		// ب. التعرف على القناة العامة
+		if strings.HasPrefix(text, "@") {
+			userChannels[chatID] = text // حفظ القناة في الذاكرة
+			sendTelegramMessage(token, chatID, "✅ تم حفظ القناة العامة بنجاح ("+text+").\nالآن أرسل لي أي نص باللغة الإنجليزية وسأقوم بنشره فوراً!")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// ج. التعرف على رابط القناة الخاصة
+		if strings.HasPrefix(text, "https://t.me/+") {
+			reply := "🔗 يبدو أن هذه قناة خاصة.\nالبوت لا يمكنه النشر عبر الرابط، يرجى إرسال الـ ID الخاص بالقناة (غالباً يبدأ بـ -100).\n\n*تلميح:* للحصول على الايدي، قم بتوجيه رسالة من قناتك الخاصة إلى بوت @userinfobot ثم انسخ الايدي وأرسله هنا."
+			sendTelegramMessage(token, chatID, reply)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// د. التعرف على الايدي الخاص بالقناة
+		if strings.HasPrefix(text, "-100") {
+			userChannels[chatID] = text // حفظ القناة في الذاكرة
+			sendTelegramMessage(token, chatID, "✅ تم حفظ القناة الخاصة بنجاح ("+text+").\nالآن أرسل لي أي نص وسأقوم بنشره!")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// هـ. نشر النص في القناة المربوطة
+		channel, exists := userChannels[chatID]
+		if !exists {
+			sendTelegramMessage(token, chatID, "⚠️ لم تقم بتحديد القناة بعد!\nيرجى إرسال معرف القناة (@) أو الايدي (-100) أولاً.")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// النشر في القناة
+		publishToChannel(token, channel, text)
+		sendTelegramMessage(token, chatID, "🚀 تم النشر في القناة بنجاح!")
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
-// دالة نشر الرسالة في القناة مع زر الترجمة
+// دالة النشر مع الزر
 func publishToChannel(token, channel, text string) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 
-	// إعداد زر الانلاين المكتوب عليه Translate
 	payload := map[string]interface{}{
 		"chat_id": channel,
 		"text":    text,
@@ -90,8 +127,8 @@ func publishToChannel(token, channel, text string) {
 			"inline_keyboard": [][]map[string]interface{}{
 				{
 					{
-						"text":          "Translate",
-						"callback_data": "translate_" + text, // ملاحظة: يجب مراعاة حدود 64 بايت لـ callback_data في النصوص الطويلة أو تخزين النص في قاعدة بيانات
+						"text":          "Translate", 
+						"callback_data": "translate", // لا نرسل النص هنا لكي لا نتجاوز حد الـ 64 بايت
 					},
 				},
 			},
@@ -102,32 +139,36 @@ func publishToChannel(token, channel, text string) {
 	http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
 }
 
-// دالة الرد عند الضغط على زر الترجمة وإظهار النافذة المنبثقة (Alert Modal مع زر حسنًا)
+// دالة التعامل مع الضغط على زر الترجمة
 func handleCallbackQuery(token string, cq *CallbackQuery) {
-	textToTranslate := strings.TrimPrefix(cq.Data, "translate_")
+	if cq.Data == "translate" {
+		// نجلب النص الأصلي من الرسالة التي يحتوي عليها الزر! (حل ذكي لمنع استخدام قواعد البيانات)
+		originalText := cq.Message.Text 
 
-	// تنفيذ الترجمة (يمكنك ربطها بأي API ترجمة مثل Google Translate أو LibreTranslate)
-	translatedText := translateToArabic(textToTranslate)
+		// نقوم بترجمة النص
+		translatedText := translateToArabic(originalText)
 
-	// استخدام show_alert: true لفتح النافذة المنبثقة (Modal) التي تحتوي على زر "حسنًا" تلقائياً من تليجرام
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", token)
-	payload := map[string]interface{}{
-		"callback_query_id": cq.ID,
-		"text":              translatedText,
-		"show_alert":        true, // هذا الخيار يظهر نافذة منبثقة مع زر "حسنًا" كما في صورتك الثانية
+		// نظهر النافذة المنبثقة Alert
+		// زر "حسنًا" يضاف تلقائياً من تليجرام عندما يكون show_alert: true
+		url := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", token)
+		payload := map[string]interface{}{
+			"callback_query_id": cq.ID,
+			"text":              translatedText,
+			"show_alert":        true, 
+		}
+
+		jsonBody, _ := json.Marshal(payload)
+		http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	}
-
-	jsonBody, _ := json.Marshal(payload)
-	http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
 }
 
-// دالة وهمية للترجمة (استبدلها بخدمة ترجمة حقيقية)
+// دالة وهمية للترجمة (يجب ربطها بـ API حقيقي مثل Google Translate)
 func translateToArabic(text string) string {
-	// ضع هنا كود الاتصال بخدمة الترجمة
-	return "الترجمة العربية: " + text
+	// كمثال توضيحي: سيقوم البوت بطباعة النص كأنه تمت ترجمته
+	return "الترجمة العربية:\n" + text + "\n\n(تمت الترجمة بنجاح)"
 }
 
-// دالة إرسال رسالة عادية للمستخدم
+// إرسال رسائل نصية عادية للمستخدم
 func sendTelegramMessage(token string, chatID int64, text string) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	payload := map[string]interface{}{
