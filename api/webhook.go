@@ -24,12 +24,13 @@ type User struct {
 }
 
 type Message struct {
-	MessageID int         `json:"message_id"`
-	Chat      Chat        `json:"chat"`
-	From      *User       `json:"from"`
-	Text      string      `json:"text"`
-	Photo     []PhotoSize `json:"photo"`
-	Caption   string      `json:"caption"`
+	MessageID    int         `json:"message_id"`
+	Chat         Chat        `json:"chat"`
+	From         *User       `json:"from"`
+	Text         string      `json:"text"`
+	Photo        []PhotoSize `json:"photo"`
+	Caption      string      `json:"caption"`
+	MediaGroupID string      `json:"media_group_id"`
 }
 
 type PhotoSize struct {
@@ -54,6 +55,12 @@ type TelegramResponse struct {
 	Result Chat `json:"result"`
 }
 
+type InputMediaPhoto struct {
+	Type    string `json:"type"`
+	Media   string `json:"media"`
+	Caption string `json:"caption,omitempty"`
+}
+
 // هيكل القناة المحفوظة
 type Channel struct {
 	ID    string `json:"id"`
@@ -62,8 +69,10 @@ type Channel struct {
 
 // هيكل المسودة الحالية للنشر
 type Draft struct {
-	PhotoID string
-	Caption string
+	Photos           []string
+	MediaGroupID     string
+	Caption          string
+	LastBotMessageID int
 }
 
 // الذاكرة المؤقتة لتدفق العمل
@@ -129,18 +138,39 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// التعامل مع رفع الصورة
+		// التعامل مع رفع الصورة أو ألبوم الصور (Media Group)
 		if len(update.Message.Photo) > 0 {
 			photoID := update.Message.Photo[len(update.Message.Photo)-1].FileID
-			userDrafts[chatID] = &Draft{PhotoID: photoID}
+			mediaGroupID := update.Message.MediaGroupID
 
-			buttons := [][]map[string]interface{}{
-				{
-					{"text": "⏩ تخطي (بدون نص)", "callback_data": "action_skip_caption", "style": "primary"},
-					{"text": "❌ إلغاء", "callback_data": "action_cancel", "style": "danger"},
-				},
+			draft, exists := userDrafts[chatID]
+
+			// إذا كانت مجموعة صور جديدة أو صورة منفردة جديدة
+			if !exists || draft.MediaGroupID != mediaGroupID || mediaGroupID == "" {
+				// مسح الرسالة السابقة إن وجدت
+				if exists && draft.LastBotMessageID != 0 {
+					deleteTelegramMessage(token, chatID, draft.LastBotMessageID)
+				}
+
+				draft = &Draft{
+					Photos:       []string{photoID},
+					MediaGroupID: mediaGroupID,
+				}
+				userDrafts[chatID] = draft
+
+				buttons := [][]map[string]interface{}{
+					{
+						{"text": "⏩ تخطي (بدون نص)", "callback_data": "action_skip_caption", "style": "primary"},
+						{"text": "❌ إلغاء", "callback_data": "action_cancel", "style": "danger"},
+					},
+				}
+				msgID := sendTelegramMessage(token, chatID, "📸 تم استلام المحتوى!\nهل تريد إضافة نص (كابشن) أسفل المحتوى؟\n\n- أرسل النص الآن كرسالة عادية.\n- أو اضغط على (تخطي) للنشر بدون نص.", buttons)
+				draft.LastBotMessageID = msgID
+			} else {
+				// إضافة الصور الإضافية بنفس الألبوم دون تكرار إرسال الأزرار
+				draft.Photos = append(draft.Photos, photoID)
 			}
-			sendTelegramMessage(token, chatID, "📸 تم استلام الصورة!\nهل تريد إضافة نص (كابشن) أسفل الصورة؟\n\n- أرسل النص الآن كرسالة عادية.\n- أو اضغط على (تخطي) للنشر بدون نص.", buttons)
+
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -149,9 +179,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		if text != "" {
 			draft, hasDraft := userDrafts[chatID]
 
-			if hasDraft && draft.PhotoID != "" && draft.Caption == "" {
+			// مسح رسالة الأزرار السابقة عند إرسال المستخدم لنص الكابشن
+			if hasDraft && draft.LastBotMessageID != 0 {
+				deleteTelegramMessage(token, chatID, draft.LastBotMessageID)
+				draft.LastBotMessageID = 0
+			}
+
+			if hasDraft && len(draft.Photos) > 0 && draft.Caption == "" {
 				draft.Caption = text
-				askConfirmation(token, chatID, "هل تريد نشر الصورة مع النص كـ كابشن؟")
+				askConfirmation(token, chatID, "هل تريد نشر المحتوى مع النص كـ كابشن؟")
 				w.WriteHeader(http.StatusOK)
 				return
 			}
@@ -167,6 +203,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 func handleCallbackQuery(token string, cq *CallbackQuery) {
 	chatID := cq.From.ID
 	data := cq.Data
+
+	// حذف الرسالة/الأزرار السابقة فور الضغط على أي زر
+	deleteTelegramMessage(token, chatID, cq.Message.MessageID)
 
 	if data == "translate" {
 		textToTranslate := cq.Message.Text
@@ -216,8 +255,10 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 			return
 		}
 
-		if draft.PhotoID != "" {
-			publishPhotoToChannel(token, targetChannel.ID, draft.PhotoID, draft.Caption)
+		if len(draft.Photos) > 1 {
+			publishMediaGroupToChannel(token, targetChannel.ID, draft.Photos, draft.Caption)
+		} else if len(draft.Photos) == 1 {
+			publishPhotoToChannel(token, targetChannel.ID, draft.Photos[0], draft.Caption)
 		} else {
 			publishTextToChannel(token, targetChannel.ID, draft.Caption)
 		}
@@ -235,7 +276,10 @@ func askConfirmation(token string, chatID int64, promptMsg string) {
 			{"text": "❌ إلغاء", "callback_data": "action_cancel", "style": "danger"},
 		},
 	}
-	sendTelegramMessage(token, chatID, promptMsg, buttons)
+	msgID := sendTelegramMessage(token, chatID, promptMsg, buttons)
+	if draft, ok := userDrafts[chatID]; ok {
+		draft.LastBotMessageID = msgID
+	}
 }
 
 func askSelectChannel(token string, chatID int64, promptMsg string) {
@@ -268,7 +312,10 @@ func askSelectChannel(token string, chatID int64, promptMsg string) {
 		{"text": "❌ إلغاء", "callback_data": "action_cancel", "style": "danger"},
 	})
 
-	sendTelegramMessage(token, chatID, promptMsg, keyboard)
+	msgID := sendTelegramMessage(token, chatID, promptMsg, keyboard)
+	if draft, ok := userDrafts[chatID]; ok {
+		draft.LastBotMessageID = msgID
+	}
 }
 
 func fetchChannelTitle(token, channelID string) (string, error) {
@@ -322,7 +369,42 @@ func publishPhotoToChannel(token, channelID, photoID, caption string) {
 	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 }
 
-func sendTelegramMessage(token string, chatID int64, text string, keyboard [][]map[string]interface{}) {
+func publishMediaGroupToChannel(token, channelID string, photos []string, caption string) {
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMediaGroup", token)
+	var mediaList []InputMediaPhoto
+	for i, photoID := range photos {
+		item := InputMediaPhoto{
+			Type:  "photo",
+			Media: photoID,
+		}
+		if i == 0 && caption != "" {
+			item.Caption = caption
+		}
+		mediaList = append(mediaList, item)
+	}
+
+	payload := map[string]interface{}{
+		"chat_id": channelID,
+		"media":   mediaList,
+	}
+	jsonBody, _ := json.Marshal(payload)
+	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+}
+
+func deleteTelegramMessage(token string, chatID int64, messageID int) {
+	if messageID == 0 {
+		return
+	}
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage", token)
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	jsonBody, _ := json.Marshal(payload)
+	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+}
+
+func sendTelegramMessage(token string, chatID int64, text string, keyboard [][]map[string]interface{}) int {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	payload := map[string]interface{}{
 		"chat_id":    chatID,
@@ -337,7 +419,20 @@ func sendTelegramMessage(token string, chatID int64, text string, keyboard [][]m
 	}
 
 	jsonBody, _ := json.Marshal(payload)
-	http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	json.NewDecoder(resp.Body).Decode(&res)
+	return res.Result.MessageID
 }
 
 func answerCallback(token, callbackID, text string, showAlert bool) {
