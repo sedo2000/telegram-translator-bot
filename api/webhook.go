@@ -1,16 +1,5 @@
 package handler
 
-// ===================================================
-// Telegram Channel Publishing Manager — Full Build
-// Features:
-//  • Multi-channel publishing (text / photo / video / album)
-//  • Preview + Edit + Translate + Custom URL Buttons
-//  • Signature / QR Code / Post stats
-//  • Inline Mode (translate to 6 languages)
-//  • 📸 Story publishing (downloads file then re-uploads as multipart)
-//  • Duplicate-publish lock + Callback guard
-// ===================================================
-
 import (
 	"bytes"
 	"encoding/json"
@@ -18,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -118,13 +106,6 @@ type Draft struct {
 	Buttons      []InlineButton
 }
 
-type StoryDraft struct {
-	FileID   string
-	Type     string // "photo" | "video"
-	Caption  string
-	Duration int // seconds
-}
-
 type PublishResult struct {
 	ChannelID string
 	Title     string
@@ -134,31 +115,20 @@ type PublishResult struct {
 	Link      string
 }
 
-// ===================================================
-// State constants
-// ===================================================
-
 const (
-	StateIdle              = ""
-	StateAwaitChannelID    = "await_channel_id"
-	StateAwaitButtonName   = "await_button_name"
-	StateAwaitButtonURL    = "await_button_url"
-	StateAwaitEditCaption  = "await_edit_caption"
-	StateAwaitText         = "await_text"
-	StateAwaitSignature    = "await_signature"
-	StateAwaitQR           = "await_qr"
-	StateAwaitStoryMedia   = "await_story_media"
-	StateAwaitStoryCaption = "await_story_caption"
+	StateIdle             = ""
+	StateAwaitChannelID   = "await_channel_id"
+	StateAwaitButtonName  = "await_button_name"
+	StateAwaitButtonURL   = "await_button_url"
+	StateAwaitEditCaption = "await_edit_caption"
+	StateAwaitText        = "await_text"
+	StateAwaitSignature   = "await_signature"
+	StateAwaitQR          = "await_qr"
 )
-
-// ===================================================
-// UserSession
-// ===================================================
 
 type UserSession struct {
 	UserID            int64
 	Draft             *Draft
-	StoryDraft        *StoryDraft
 	State             string
 	Channels          []Channel
 	SelectedChannels  map[string]bool
@@ -171,21 +141,14 @@ type UserSession struct {
 	Guard             map[string]time.Time
 }
 
-func (s *UserSession) StoryDraftDurationOrDefault() int {
-	if s.StoryDraft != nil && s.StoryDraft.Duration > 0 {
-		return s.StoryDraft.Duration
-	}
-	return 86400
-}
-
 // ===================================================
-// In-memory state
+// In-memory state (Vercel warm instance only)
 // ===================================================
 
 var (
 	sessionsMu sync.RWMutex
 	sessions   = make(map[int64]*UserSession)
-	httpClient = &http.Client{Timeout: 45 * time.Second}
+	httpClient = &http.Client{Timeout: 12 * time.Second}
 )
 
 func getSession(userID int64) *UserSession {
@@ -224,7 +187,7 @@ func guardCallback(s *UserSession, cqID string) bool {
 }
 
 // ===================================================
-// Telegram API helper (JSON)
+// Central Telegram API helper
 // ===================================================
 
 type tgEnvelope struct {
@@ -276,68 +239,6 @@ func callTelegramAPI(method string, payload interface{}) (json.RawMessage, error
 }
 
 // ===================================================
-// Telegram API helper (multipart/form-data) — for postStory
-// ===================================================
-
-func callTelegramAPIMultipart(method string, fields map[string]string, files map[string][]byte) (json.RawMessage, error) {
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if token == "" {
-		return nil, errors.New("TELEGRAM_BOT_TOKEN is not set")
-	}
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/%s", token, method)
-
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	for k, v := range fields {
-		if err := writer.WriteField(k, v); err != nil {
-			return nil, fmt.Errorf("multipart field %s: %w", k, err)
-		}
-	}
-	for fieldName, data := range files {
-		part, err := writer.CreateFormFile(fieldName, fieldName)
-		if err != nil {
-			return nil, fmt.Errorf("multipart create %s: %w", fieldName, err)
-		}
-		if _, err := part.Write(data); err != nil {
-			return nil, fmt.Errorf("multipart write %s: %w", fieldName, err)
-		}
-	}
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("multipart close: %w", err)
-	}
-
-	req, err := http.NewRequest(http.MethodPost, apiURL, &buf)
-	if err != nil {
-		return nil, fmt.Errorf("%s: new request: %w", method, err)
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%s: http: %w", method, err)
-	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("%s: read: %w", method, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: HTTP %d: %s", method, resp.StatusCode, truncate(string(respBytes), 300))
-	}
-
-	var env tgEnvelope
-	if err := json.Unmarshal(respBytes, &env); err != nil {
-		return nil, fmt.Errorf("%s: bad json: %w", method, err)
-	}
-	if !env.OK {
-		return nil, fmt.Errorf("%s: telegram error: %s", method, env.Description)
-	}
-	return env.Result, nil
-}
-
-// ===================================================
 // Action wrappers
 // ===================================================
 
@@ -363,6 +264,9 @@ func sendMessage(chatID int64, text string, keyboard [][]map[string]interface{})
 	return res.MessageID
 }
 
+// editMessageText returns:
+//   - nil           on success OR "message is not modified"
+//   - error         on real failure
 func editMessageText(chatID int64, messageID int, text string, keyboard [][]map[string]interface{}) error {
 	if messageID == 0 {
 		return errors.New("editMessageText: messageID is 0")
@@ -379,6 +283,7 @@ func editMessageText(chatID int64, messageID int, text string, keyboard [][]map[
 	}
 	_, err := callTelegramAPI("editMessageText", payload)
 	if err != nil {
+		// ignore "not modified" — it means the message already shows that content
 		if strings.Contains(strings.ToLower(err.Error()), "message is not modified") {
 			return nil
 		}
@@ -427,65 +332,6 @@ func getChat(channelID string) (*Chat, error) {
 		return nil, err
 	}
 	return &c, nil
-}
-
-// ===================================================
-// File download (for Stories)
-// ===================================================
-
-// downloadTelegramFile يجلب محتوى ملف من سيرفرات Telegram عبر file_id.
-func downloadTelegramFile(fileID string) ([]byte, string, error) {
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if token == "" {
-		return nil, "", errors.New("TELEGRAM_BOT_TOKEN is not set")
-	}
-
-	raw, err := callTelegramAPI("getFile", map[string]interface{}{
-		"file_id": fileID,
-	})
-	if err != nil {
-		return nil, "", fmt.Errorf("getFile: %w", err)
-	}
-
-	var fileInfo struct {
-		FileID   string `json:"file_id"`
-		FilePath string `json:"file_path"`
-		FileSize int64  `json:"file_size"`
-	}
-	if err := json.Unmarshal(raw, &fileInfo); err != nil {
-		return nil, "", fmt.Errorf("getFile unmarshal: %w", err)
-	}
-	if fileInfo.FilePath == "" {
-		return nil, "", errors.New("getFile: empty file_path")
-	}
-
-	fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, fileInfo.FilePath)
-	resp, err := httpClient.Get(fileURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("download: HTTP %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("download read: %w", err)
-	}
-	if len(data) == 0 {
-		return nil, "", errors.New("download: empty file")
-	}
-	if len(data) > 20*1024*1024 {
-		return nil, "", fmt.Errorf("file too large: %d bytes", len(data))
-	}
-
-	ext := ".jpg"
-	if idx := strings.LastIndex(fileInfo.FilePath, "."); idx != -1 {
-		ext = fileInfo.FilePath[idx:]
-	}
-	return data, ext, nil
 }
 
 // ===================================================
@@ -541,7 +387,7 @@ func handleMessage(m *Message) {
 	s := getSession(userID)
 	text := strings.TrimSpace(m.Text)
 
-	// ---- Commands ----
+	// Commands
 	if strings.HasPrefix(text, "/") {
 		fields := strings.Fields(text)
 		cmd := fields[0]
@@ -557,7 +403,6 @@ func handleMessage(m *Message) {
 			return
 		case "/cancel":
 			clearDraft(s)
-			s.StoryDraft = nil
 			s.State = StateIdle
 			sendMessage(userID, "❌ تم إلغاء العملية والعودة للقائمة.", nil)
 			showMainMenu(userID, s)
@@ -579,8 +424,8 @@ func handleMessage(m *Message) {
 			s.State = StateAwaitSignature
 			sendMessage(userID,
 				"✍️ <b>التوقيع التلقائي</b>\n\n"+
-					"أرسل النص الذي سيُضاف أسفل كل منشور.\n"+
-					"• أرسل <code>-</code> لحذف التوقيع.\n"+
+					"أرسل النص الذي سيُضاف أسفل كل منشور.\n\n"+
+					"• أرسل <code>-</code> لحذف التوقيع الحالي.\n"+
 					"• أرسل /cancel للإلغاء.", nil)
 			return
 		case "/qr":
@@ -591,61 +436,10 @@ func handleMessage(m *Message) {
 			}
 			sendQRCode(userID, fields[1])
 			return
-		case "/story":
-			s.StoryDraft = nil
-			s.State = StateAwaitStoryMedia
-			sendMessage(userID,
-				"📸 <b>نشر قصة للقناة</b>\n\n"+
-					"أرسل صورة أو فيديو للقصة.\n\n"+
-					"⚠️ تأكد أن البوت مشرف في القناة مع صلاحية <b>نشر القصص</b>.",
-				backKeyboard())
-			return
 		}
 	}
 
-	// ---- Story media reception (BEFORE regular media) ----
-	if s.State == StateAwaitStoryMedia {
-		if len(m.Photo) > 0 {
-			s.StoryDraft = &StoryDraft{
-				FileID: m.Photo[len(m.Photo)-1].FileID,
-				Type:   "photo",
-			}
-			if m.Caption != "" {
-				s.StoryDraft.Caption = cleanString(m.Caption)
-			}
-			s.State = StateIdle
-			showStoryDurationPicker(userID, s)
-			return
-		}
-		if m.Video != nil {
-			s.StoryDraft = &StoryDraft{
-				FileID: m.Video.FileID,
-				Type:   "video",
-			}
-			if m.Caption != "" {
-				s.StoryDraft.Caption = cleanString(m.Caption)
-			}
-			s.State = StateIdle
-			showStoryDurationPicker(userID, s)
-			return
-		}
-		sendMessage(userID, "⚠️ أرسل صورة أو فيديو فقط للقصة.", backKeyboard())
-		return
-	}
-
-	if s.State == StateAwaitStoryCaption {
-		if s.StoryDraft == nil {
-			s.State = StateIdle
-			sendMessage(userID, "⚠️ لا توجد قصة قيد الإنشاء.", nil)
-			return
-		}
-		s.StoryDraft.Caption = cleanString(text)
-		s.State = StateIdle
-		showStoryDurationPicker(userID, s)
-		return
-	}
-
-	// ---- Other state-driven text ----
+	// State-driven input
 	switch s.State {
 	case StateAwaitChannelID:
 		handleAddChannelInput(userID, s, text)
@@ -658,7 +452,7 @@ func handleMessage(m *Message) {
 		}
 		s.Draft.Caption = cleanString(text)
 		s.State = StateIdle
-		upsertPreview(userID, s)
+		upsertPreview(userID, s) // ← FIX: uses edit-or-send
 		return
 	case StateAwaitButtonName:
 		s.PendingButtonName = cleanString(text)
@@ -704,13 +498,13 @@ func handleMessage(m *Message) {
 		return
 	}
 
-	// ---- Regular media ----
+	// Media
 	if len(m.Photo) > 0 || m.Video != nil {
 		handleIncomingMedia(userID, s, m)
 		return
 	}
 
-	// ---- Text ----
+	// Text
 	if text != "" {
 		handleIncomingText(userID, s, m)
 		return
@@ -718,7 +512,7 @@ func handleMessage(m *Message) {
 }
 
 // ===================================================
-// Regular media & text
+// Media handling — one preview, edit-in-place
 // ===================================================
 
 func handleIncomingMedia(userID int64, s *UserSession, m *Message) {
@@ -756,6 +550,8 @@ func handleIncomingMedia(userID int64, s *UserSession, m *Message) {
 		s.Draft.Caption = cleanString(m.Caption)
 	}
 	s.LastMediaTime = now
+
+	// Always edit-in-place; sends only once
 	upsertPreview(userID, s)
 }
 
@@ -790,6 +586,7 @@ func clearDraft(s *UserSession) {
 	s.PendingButtonName = ""
 }
 
+// upsertPreview: tries to edit existing preview; falls back to sending new.
 func upsertPreview(userID int64, s *UserSession) {
 	if s.Draft == nil {
 		return
@@ -801,6 +598,7 @@ func upsertPreview(userID int64, s *UserSession) {
 		if err := editMessageText(userID, s.LastPreviewMsgID, desc, kb); err == nil {
 			return
 		}
+		// edit failed (deleted / too old) → reset and send new
 		s.LastPreviewMsgID = 0
 	}
 	msgID := sendMessage(userID, desc, kb)
@@ -844,6 +642,8 @@ func describeDraft(d *Draft) string {
 		b.WriteString("\n📝 <b>النص:</b>\n")
 		b.WriteString(htmlEscape(truncate(d.Caption, 500)))
 		b.WriteString("\n")
+
+		// ----- Post stats -----
 		chars := len([]rune(d.Caption))
 		words := len(strings.Fields(d.Caption))
 		readSec := chars / 15
@@ -865,7 +665,7 @@ func describeDraft(d *Draft) string {
 }
 
 // ===================================================
-// Publishing (regular posts)
+// Publishing
 // ===================================================
 
 func publishToChannels(channels []Channel, d *Draft, signature string) []PublishResult {
@@ -930,6 +730,7 @@ func translateButtonKeyboard() [][]map[string]interface{} {
 	}
 }
 
+// userButtonsToInline ALWAYS includes the Translate button (last row).
 func userButtonsToInline(b []InlineButton) [][]map[string]interface{} {
 	out := make([][]map[string]interface{}, 0, len(b)+1)
 	for _, x := range b {
@@ -1005,12 +806,19 @@ func publishVideo(channelID, videoID, caption string, extra []InlineButton) (int
 	return res.MessageID, nil
 }
 
+// publishMediaGroup:
+//   1) sends the album via sendMediaGroup
+//   2) then sends a SEPARATE message with the inline buttons.
+//      The separate message MUST have non-empty, non-whitespace text
+//      (Telegram rejects pure-whitespace text with "message text is empty").
 func publishMediaGroup(channelID string, items []MediaItem, caption string, extra []InlineButton) (int, error) {
 	media := make([]InputMedia, 0, len(items))
 	for i, it := range items {
 		m := InputMedia{Type: it.Type, Media: it.FileID}
 		if i == 0 && caption != "" {
 			m.Caption = caption
+			// Note: parse_mode for media group captions is not set per-item;
+			// if you need HTML captions here, extend InputMedia with ParseMode.
 		}
 		media = append(media, m)
 	}
@@ -1032,6 +840,8 @@ func publishMediaGroup(channelID string, items []MediaItem, caption string, extr
 		firstMsgID = msgs[0].MessageID
 	}
 
+	// Send a visible marker message with the inline keyboard.
+	// "▼" is non-whitespace so Telegram won't reject it.
 	btnPayload := map[string]interface{}{
 		"chat_id":      channelID,
 		"text":         "▼",
@@ -1040,140 +850,22 @@ func publishMediaGroup(channelID string, items []MediaItem, caption string, extr
 	if firstMsgID != 0 {
 		btnPayload["reply_to_message_id"] = firstMsgID
 	}
+
 	if _, err := callTelegramAPI("sendMessage", btnPayload); err != nil {
 		log.Printf("publishMediaGroup buttons (reply): %v", err)
+		// fallback: without reply
 		delete(btnPayload, "reply_to_message_id")
 		if _, err2 := callTelegramAPI("sendMessage", btnPayload); err2 != nil {
 			log.Printf("publishMediaGroup buttons (no reply): %v", err2)
+			// Last resort: use "." as text (rare fallback)
 			btnPayload["text"] = "."
 			if _, err3 := callTelegramAPI("sendMessage", btnPayload); err3 != nil {
 				log.Printf("publishMediaGroup buttons (dot): %v", err3)
 			}
 		}
 	}
+
 	return firstMsgID, nil
-}
-
-// ===================================================
-// Story publishing — FIXED: download + multipart upload
-// ===================================================
-
-func postStory(channelID string, sd *StoryDraft) error {
-	if sd == nil {
-		return errors.New("story draft is nil")
-	}
-	if sd.Type != "photo" && sd.Type != "video" {
-		return fmt.Errorf("unsupported story type: %s", sd.Type)
-	}
-
-	// 1) تحميل الملف من Telegram (postStory لا يقبل file_id)
-	fileBytes, _, err := downloadTelegramFile(sd.FileID)
-	if err != nil {
-		return fmt.Errorf("download file: %w", err)
-	}
-
-	active := sd.Duration
-	if active == 0 {
-		active = 86400
-	}
-
-	attachName := "story_file"
-
-	content := map[string]interface{}{
-		"type": sd.Type,
-	}
-	if sd.Type == "photo" {
-		content["photo"] = "attach://" + attachName
-	} else {
-		content["video"] = "attach://" + attachName
-	}
-	contentJSON, _ := json.Marshal(content)
-
-	fields := map[string]string{
-		"chat_id":       channelID,
-		"content":       string(contentJSON),
-		"active_period": strconv.Itoa(active),
-	}
-	if sd.Caption != "" {
-		fields["caption"] = sd.Caption
-		fields["parse_mode"] = "HTML"
-	}
-
-	files := map[string][]byte{
-		attachName: fileBytes,
-	}
-
-	_, err = callTelegramAPIMultipart("postStory", fields, files)
-	return err
-}
-
-func showStoryDurationPicker(chatID int64, s *UserSession) {
-	if s.StoryDraft == nil {
-		sendMessage(chatID, "⚠️ لا توجد قصة قيد الإنشاء.", backKeyboard())
-		return
-	}
-	kb := [][]map[string]interface{}{
-		{
-			btn("⏱ 6 ساعات", "story_dur_21600", "primary"),
-			btn("⏱ 12 ساعة", "story_dur_43200", "primary"),
-		},
-		{
-			btn("⏱ 24 ساعة", "story_dur_86400", "success"),
-			btn("⏱ 48 ساعة", "story_dur_172800", "primary"),
-		},
-		{
-			btn("✏️ تعديل النص", "story_edit_caption", "primary"),
-		},
-		{
-			btn("❌ إلغاء", "story_cancel", "danger"),
-		},
-	}
-	capText := "<i>(بدون نص)</i>"
-	if s.StoryDraft.Caption != "" {
-		capText = htmlEscape(truncate(s.StoryDraft.Caption, 300))
-	}
-	typeLabel := "📷 صورة"
-	if s.StoryDraft.Type == "video" {
-		typeLabel = "🎥 فيديو"
-	}
-	sendMessage(chatID,
-		fmt.Sprintf("⏱ <b>اختر مدة نشر القصة</b>\n\n📎 النوع: %s\n📝 النص:\n%s",
-			typeLabel, capText),
-		kb)
-}
-
-func showStoryChannelPicker(chatID int64, s *UserSession) {
-	if len(s.Channels) == 0 {
-		sendMessage(chatID,
-			"⚠️ لا توجد قنوات مضافة. أضف قناة أولاً من <b>إدارة القنوات</b>.",
-			[][]map[string]interface{}{
-				{btn("📢 إدارة القنوات", "menu_channels", "primary")},
-				{btn("🏠 القائمة الرئيسية", "menu", "primary")},
-			})
-		return
-	}
-	var kb [][]map[string]interface{}
-	for i, ch := range s.Channels {
-		kb = append(kb, []map[string]interface{}{
-			btn("📢 "+truncate(ch.Title, 35), fmt.Sprintf("story_ch_%d", i), "primary"),
-		})
-	}
-	kb = append(kb, []map[string]interface{}{btn("❌ إلغاء", "story_cancel", "danger")})
-	sendMessage(chatID, "📢 <b>اختر القناة لنشر القصة فيها:</b>", kb)
-}
-
-func durationLabel(seconds int) string {
-	switch seconds {
-	case 21600:
-		return "6 ساعات"
-	case 43200:
-		return "12 ساعة"
-	case 86400:
-		return "24 ساعة"
-	case 172800:
-		return "48 ساعة"
-	}
-	return fmt.Sprintf("%d ثانية", seconds)
 }
 
 // ===================================================
@@ -1224,84 +916,6 @@ func handleCallback(cq *CallbackQuery) {
 		deleteMessage(chatID, cq.Message.MessageID)
 		s.State = StateAwaitQR
 		sendMessage(chatID, "📱 أرسل الرابط الذي تريد تحويله إلى QR Code.", backKeyboard())
-	case data == "menu_signature":
-		deleteMessage(chatID, cq.Message.MessageID)
-		s.State = StateAwaitSignature
-		sendMessage(chatID,
-			"✍️ <b>التوقيع التلقائي</b>\n\n"+
-				"أرسل النص الذي سيُضاف أسفل كل منشور.\n"+
-				"• أرسل <code>-</code> لحذف التوقيع.",
-			backKeyboard())
-
-	// -------- story flow --------
-	case data == "menu_story":
-		deleteMessage(chatID, cq.Message.MessageID)
-		s.StoryDraft = nil
-		s.State = StateAwaitStoryMedia
-		sendMessage(chatID,
-			"📸 <b>نشر قصة للقناة</b>\n\n"+
-				"أرسل صورة أو فيديو للقصة.\n"+
-				"يمكنك إرفاق نص مع الوسائط.\n\n"+
-				"⚠️ تأكد أن البوت مشرف في القناة مع صلاحية <b>نشر القصص</b>.",
-			backKeyboard())
-	case data == "story_edit_caption":
-		deleteMessage(chatID, cq.Message.MessageID)
-		s.State = StateAwaitStoryCaption
-		sendMessage(chatID, "✏️ أرسل نص القصة الآن.", nil)
-	case data == "story_cancel":
-		s.StoryDraft = nil
-		s.State = StateIdle
-		deleteMessage(chatID, cq.Message.MessageID)
-		sendMessage(chatID, "❌ تم إلغاء القصة.", nil)
-		showMainMenu(chatID, s)
-	case strings.HasPrefix(data, "story_dur_"):
-		if s.StoryDraft == nil {
-			answerCallback(cq.ID, "لا توجد قصة.", true)
-			return
-		}
-		dur, _ := strconv.Atoi(strings.TrimPrefix(data, "story_dur_"))
-		s.StoryDraft.Duration = dur
-		deleteMessage(chatID, cq.Message.MessageID)
-		showStoryChannelPicker(chatID, s)
-	case strings.HasPrefix(data, "story_ch_"):
-		if s.StoryDraft == nil {
-			answerCallback(cq.ID, "لا توجد قصة.", true)
-			return
-		}
-		idx, _ := strconv.Atoi(strings.TrimPrefix(data, "story_ch_"))
-		if idx < 0 || idx >= len(s.Channels) {
-			answerCallback(cq.ID, "قناة غير صحيحة.", true)
-			return
-		}
-		target := s.Channels[idx]
-		dur := s.StoryDraftDurationOrDefault()
-		deleteMessage(chatID, cq.Message.MessageID)
-		answerCallback(cq.ID, "⏳ جاري نشر القصة…", false)
-
-		err := postStory(target.ID, s.StoryDraft)
-		s.StoryDraft = nil
-
-		if err != nil {
-			log.Printf("postStory(%s): %v", target.ID, err)
-			sendMessage(chatID,
-				fmt.Sprintf("❌ <b>فشل نشر القصة</b>\n\n📢 %s\n\n<code>%s</code>\n\n"+
-					"<i>تأكد من:\n"+
-					"• منح البوت صلاحية نشر القصص\n"+
-					"• أن القناة تدعم القصص\n"+
-					"• أن حجم الملف أقل من 20MB</i>",
-					htmlEscape(target.Title), htmlEscape(err.Error())),
-				[][]map[string]interface{}{
-					{btn("🏠 القائمة الرئيسية", "menu", "primary")},
-				})
-			return
-		}
-		sendMessage(chatID,
-			fmt.Sprintf("✅ <b>تم نشر القصة بنجاح!</b>\n\n📢 %s\n⏱ المدة: %s",
-				htmlEscape(target.Title), durationLabel(dur)),
-			[][]map[string]interface{}{
-				{btn("📸 نشر قصة أخرى", "menu_story", "success")},
-				{btn("🏠 القائمة الرئيسية", "menu", "primary")},
-			})
 
 	// -------- channels --------
 	case data == "ch_add":
@@ -1341,7 +955,7 @@ func handleCallback(cq *CallbackQuery) {
 		showChannelSelector(chatID, s)
 	case data == "preview_edit_caption":
 		deleteMessage(chatID, cq.Message.MessageID)
-		s.LastPreviewMsgID = 0
+		s.LastPreviewMsgID = 0 // ← CRITICAL FIX: reset so next update sends fresh
 		s.State = StateAwaitEditCaption
 		sendMessage(chatID, "✏️ أرسل النص الجديد للمنشور.\nأرسل /cancel للإلغاء.", nil)
 	case data == "preview_translate":
@@ -1509,7 +1123,8 @@ func showChannelSelector(chatID int64, s *UserSession) {
 	if len(s.Channels) == 0 {
 		sendMessage(chatID,
 			"⚠️ <b>لا توجد قنوات مضافة!</b>\n\n"+
-				"انتقل إلى <b>إدارة القنوات</b> ثم اضغط ➕ إضافة قناة.",
+				"انتقل إلى <b>إدارة القنوات</b> ثم اضغط ➕ إضافة قناة.\n\n"+
+				"<i>ملاحظة: على Vercel قد تُفقد قائمة القنوات عند إعادة تشغيل السيرفر.</i>",
 			[][]map[string]interface{}{
 				{btn("📢 إدارة القنوات", "menu_channels", "primary")},
 				{btn("🏠 القائمة الرئيسية", "menu", "primary")},
@@ -1581,10 +1196,12 @@ func toggleChannelSelection(s *UserSession, idx int) {
 }
 
 func handleConfirmPublish(chatID int64, s *UserSession, cq *CallbackQuery) {
+	// Duplicate-publish lock (10s)
 	if !s.LastPublishTime.IsZero() && time.Since(s.LastPublishTime) < 10*time.Second {
 		answerCallback(cq.ID, "⏳ يرجى الانتظار قبل النشر مرة أخرى.", true)
 		return
 	}
+
 	if s.Draft == nil {
 		answerCallback(cq.ID, "لا يوجد منشور", true)
 		return
@@ -1669,14 +1286,11 @@ func showMainMenu(chatID int64, s *UserSession) {
 			btn("📤 نشر", "menu_publish", "success"),
 		},
 		{
-			btn("📸 نشر قصة", "menu_story", "success"),
 			btn("🌍 الترجمة", "menu_languages", "primary"),
-		},
-		{
 			btn("📱 QR Code", "menu_qr", "primary"),
-			btn("⚙️ الإعدادات", "menu_settings", "primary"),
 		},
 		{
+			btn("⚙️ الإعدادات", "menu_settings", "primary"),
 			btn("❓ المساعدة", "menu_help", "primary"),
 		},
 	}
@@ -1691,7 +1305,6 @@ func showHelp(chatID int64) {
 		"• /start /menu — لوحة التحكم\n" +
 		"• /channels — إدارة القنوات\n" +
 		"• /publish — بدء النشر\n" +
-		"• /story — نشر قصة للقناة\n" +
 		"• /languages — لغات الترجمة\n" +
 		"• /signature — توقيع تلقائي\n" +
 		"• /qr &lt;url&gt; — تحويل رابط إلى QR\n" +
@@ -1702,10 +1315,6 @@ func showHelp(chatID int64) {
 		"2️⃣ أضف القناة من إدارة القنوات\n" +
 		"3️⃣ أرسل المحتوى (نص/صورة/فيديو/ألبوم)\n" +
 		"4️⃣ اختر القنوات ثم اضغط 🚀 نشر\n\n" +
-		"<b>📸 نشر القصص:</b>\n" +
-		"• من القائمة اختر 📸 نشر قصة\n" +
-		"• أو استخدم /story\n" +
-		"• تحتاج صلاحية \"نشر القصص\" في القناة\n\n" +
 		"<b>🌐 Inline Mode:</b>\n" +
 		"في أي محادثة اكتب:\n" +
 		"<code>@YourBotName نص</code>\n" +
@@ -1820,7 +1429,7 @@ func sendQRCode(chatID int64, data string) {
 }
 
 // ===================================================
-// Inline Translate button
+// Inline Translate button on published posts
 // ===================================================
 
 func handleInlineTranslate(cq *CallbackQuery) {
@@ -1839,6 +1448,7 @@ func handleInlineTranslate(cq *CallbackQuery) {
 			}
 		}
 	}
+	// Also try the replied-to message of the button message itself
 	if strings.TrimSpace(text) == "" || strings.TrimSpace(text) == "▼" {
 		if msg != nil && msg.ReplyToMessage != nil {
 			if cleanString(msg.ReplyToMessage.Caption) != "" {
