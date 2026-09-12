@@ -7,7 +7,7 @@ package handler
 //  • Preview + Edit + Translate + Custom URL Buttons
 //  • Signature / QR Code / Post stats
 //  • Inline Mode (translate to 6 languages)
-//  • 📸 Story publishing (Bot API 8.0+)
+//  • 📸 Story publishing (downloads file then re-uploads as multipart)
 //  • Duplicate-publish lock + Callback guard
 // ===================================================
 
@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -170,7 +171,6 @@ type UserSession struct {
 	Guard             map[string]time.Time
 }
 
-// StoryDraftDurationOrDefault — default 24h
 func (s *UserSession) StoryDraftDurationOrDefault() int {
 	if s.StoryDraft != nil && s.StoryDraft.Duration > 0 {
 		return s.StoryDraft.Duration
@@ -185,7 +185,7 @@ func (s *UserSession) StoryDraftDurationOrDefault() int {
 var (
 	sessionsMu sync.RWMutex
 	sessions   = make(map[int64]*UserSession)
-	httpClient = &http.Client{Timeout: 20 * time.Second}
+	httpClient = &http.Client{Timeout: 45 * time.Second}
 )
 
 func getSession(userID int64) *UserSession {
@@ -224,7 +224,7 @@ func guardCallback(s *UserSession, cqID string) bool {
 }
 
 // ===================================================
-// Telegram API helper
+// Telegram API helper (JSON)
 // ===================================================
 
 type tgEnvelope struct {
@@ -250,6 +250,68 @@ func callTelegramAPI(method string, payload interface{}) (json.RawMessage, error
 		return nil, fmt.Errorf("%s: new request: %w", method, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s: http: %w", method, err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s: read: %w", method, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: HTTP %d: %s", method, resp.StatusCode, truncate(string(respBytes), 300))
+	}
+
+	var env tgEnvelope
+	if err := json.Unmarshal(respBytes, &env); err != nil {
+		return nil, fmt.Errorf("%s: bad json: %w", method, err)
+	}
+	if !env.OK {
+		return nil, fmt.Errorf("%s: telegram error: %s", method, env.Description)
+	}
+	return env.Result, nil
+}
+
+// ===================================================
+// Telegram API helper (multipart/form-data) — for postStory
+// ===================================================
+
+func callTelegramAPIMultipart(method string, fields map[string]string, files map[string][]byte) (json.RawMessage, error) {
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if token == "" {
+		return nil, errors.New("TELEGRAM_BOT_TOKEN is not set")
+	}
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/%s", token, method)
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	for k, v := range fields {
+		if err := writer.WriteField(k, v); err != nil {
+			return nil, fmt.Errorf("multipart field %s: %w", k, err)
+		}
+	}
+	for fieldName, data := range files {
+		part, err := writer.CreateFormFile(fieldName, fieldName)
+		if err != nil {
+			return nil, fmt.Errorf("multipart create %s: %w", fieldName, err)
+		}
+		if _, err := part.Write(data); err != nil {
+			return nil, fmt.Errorf("multipart write %s: %w", fieldName, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("multipart close: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, apiURL, &buf)
+	if err != nil {
+		return nil, fmt.Errorf("%s: new request: %w", method, err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -368,6 +430,65 @@ func getChat(channelID string) (*Chat, error) {
 }
 
 // ===================================================
+// File download (for Stories)
+// ===================================================
+
+// downloadTelegramFile يجلب محتوى ملف من سيرفرات Telegram عبر file_id.
+func downloadTelegramFile(fileID string) ([]byte, string, error) {
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if token == "" {
+		return nil, "", errors.New("TELEGRAM_BOT_TOKEN is not set")
+	}
+
+	raw, err := callTelegramAPI("getFile", map[string]interface{}{
+		"file_id": fileID,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("getFile: %w", err)
+	}
+
+	var fileInfo struct {
+		FileID   string `json:"file_id"`
+		FilePath string `json:"file_path"`
+		FileSize int64  `json:"file_size"`
+	}
+	if err := json.Unmarshal(raw, &fileInfo); err != nil {
+		return nil, "", fmt.Errorf("getFile unmarshal: %w", err)
+	}
+	if fileInfo.FilePath == "" {
+		return nil, "", errors.New("getFile: empty file_path")
+	}
+
+	fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, fileInfo.FilePath)
+	resp, err := httpClient.Get(fileURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("download: HTTP %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("download read: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, "", errors.New("download: empty file")
+	}
+	if len(data) > 20*1024*1024 {
+		return nil, "", fmt.Errorf("file too large: %d bytes", len(data))
+	}
+
+	ext := ".jpg"
+	if idx := strings.LastIndex(fileInfo.FilePath, "."); idx != -1 {
+		ext = fileInfo.FilePath[idx:]
+	}
+	return data, ext, nil
+}
+
+// ===================================================
 // Webhook entrypoint
 // ===================================================
 
@@ -482,7 +603,7 @@ func handleMessage(m *Message) {
 		}
 	}
 
-	// ---- Story media reception (MUST come before regular media) ----
+	// ---- Story media reception (BEFORE regular media) ----
 	if s.State == StateAwaitStoryMedia {
 		if len(m.Photo) > 0 {
 			s.StoryDraft = &StoryDraft{
@@ -934,7 +1055,7 @@ func publishMediaGroup(channelID string, items []MediaItem, caption string, extr
 }
 
 // ===================================================
-// Story publishing (Bot API 8.0+)
+// Story publishing — FIXED: download + multipart upload
 // ===================================================
 
 func postStory(channelID string, sd *StoryDraft) error {
@@ -945,13 +1066,10 @@ func postStory(channelID string, sd *StoryDraft) error {
 		return fmt.Errorf("unsupported story type: %s", sd.Type)
 	}
 
-	content := map[string]interface{}{
-		"type": sd.Type,
-	}
-	if sd.Type == "photo" {
-		content["photo"] = sd.FileID
-	} else {
-		content["video"] = sd.FileID
+	// 1) تحميل الملف من Telegram (postStory لا يقبل file_id)
+	fileBytes, _, err := downloadTelegramFile(sd.FileID)
+	if err != nil {
+		return fmt.Errorf("download file: %w", err)
 	}
 
 	active := sd.Duration
@@ -959,17 +1077,33 @@ func postStory(channelID string, sd *StoryDraft) error {
 		active = 86400
 	}
 
-	payload := map[string]interface{}{
+	attachName := "story_file"
+
+	content := map[string]interface{}{
+		"type": sd.Type,
+	}
+	if sd.Type == "photo" {
+		content["photo"] = "attach://" + attachName
+	} else {
+		content["video"] = "attach://" + attachName
+	}
+	contentJSON, _ := json.Marshal(content)
+
+	fields := map[string]string{
 		"chat_id":       channelID,
-		"content":       content,
-		"active_period": active,
+		"content":       string(contentJSON),
+		"active_period": strconv.Itoa(active),
 	}
 	if sd.Caption != "" {
-		payload["caption"] = sd.Caption
-		payload["parse_mode"] = "HTML"
+		fields["caption"] = sd.Caption
+		fields["parse_mode"] = "HTML"
 	}
 
-	_, err := callTelegramAPI("postStory", payload)
+	files := map[string][]byte{
+		attachName: fileBytes,
+	}
+
+	_, err = callTelegramAPIMultipart("postStory", fields, files)
 	return err
 }
 
@@ -1142,7 +1276,7 @@ func handleCallback(cq *CallbackQuery) {
 		target := s.Channels[idx]
 		dur := s.StoryDraftDurationOrDefault()
 		deleteMessage(chatID, cq.Message.MessageID)
-		answerCallback(cq.ID, "⏳ جاري نشر القصة...", false)
+		answerCallback(cq.ID, "⏳ جاري نشر القصة…", false)
 
 		err := postStory(target.ID, s.StoryDraft)
 		s.StoryDraft = nil
@@ -1154,7 +1288,7 @@ func handleCallback(cq *CallbackQuery) {
 					"<i>تأكد من:\n"+
 					"• منح البوت صلاحية نشر القصص\n"+
 					"• أن القناة تدعم القصص\n"+
-					"• أن الوسيط صالح</i>",
+					"• أن حجم الملف أقل من 20MB</i>",
 					htmlEscape(target.Title), htmlEscape(err.Error())),
 				[][]map[string]interface{}{
 					{btn("🏠 القائمة الرئيسية", "menu", "primary")},
