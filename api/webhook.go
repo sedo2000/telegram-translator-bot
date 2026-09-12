@@ -1,7 +1,16 @@
 package handler
 
 // ===================================================
-// Telegram Channel Publishing Manager — Extended Build
+// Telegram Channel Publishing Manager — Full Extended Build
+// Features:
+//  • Multi-channel publishing (all media types)
+//  • Preview + Edit + Translate + Format buttons
+//  • Signature / QR Code / Post stats / Hashtags
+//  • Inline Mode (translate to 6 languages)
+//  • Channel admin commands (/del, /pin, /unpin, /tr, /react, /info)
+//  • URL shortener / Split long text / Silent + Protect / Auto-pin
+//  • Announcement channel + Discussion group comments
+//  • Backup / Restore via /export & /import
 // ===================================================
 
 import (
@@ -149,24 +158,18 @@ type InlineQuery struct {
 // ===================================================
 
 type MediaItem struct {
-	Type string // photo/video/voice/audio/document/animation/sticker/location/contact/poll
-	// File-based
-	FileID string
-	// Audio/Document
-	FileName  string
-	Title     string
-	Performer string
-	Duration  int
-	// Sticker
-	Emoji string
-	// Location
-	Latitude  float64
-	Longitude float64
-	// Contact
-	PhoneNumber string
-	FirstName   string
-	LastName    string
-	// Poll
+	Type          string
+	FileID        string
+	FileName      string
+	Title         string
+	Performer     string
+	Duration      int
+	Emoji         string
+	Latitude      float64
+	Longitude     float64
+	PhoneNumber   string
+	FirstName     string
+	LastName      string
 	Question      string
 	Options       []string
 	IsQuiz        bool
@@ -190,10 +193,10 @@ type Channel struct {
 }
 
 type Draft struct {
-	Media        []MediaItem
-	MediaGroupID string
-	Caption      string
-	Buttons      []InlineButton
+	Media         []MediaItem
+	MediaGroupID  string
+	Caption       string
+	Buttons       []InlineButton
 	SuggestedTags []string
 }
 
@@ -219,7 +222,6 @@ const (
 	StateAwaitText        = "await_text"
 	StateAwaitSignature   = "await_signature"
 	StateAwaitQR          = "await_qr"
-	StateAwaitAnnounce    = "await_announce"
 	StateAwaitImport      = "await_import"
 )
 
@@ -252,16 +254,16 @@ type UserSession struct {
 }
 
 type SessionBackup struct {
-	V                 int       `json:"v"`
-	Channels          []Channel `json:"channels,omitempty"`
-	Signature         string    `json:"signature,omitempty"`
-	SelectedLanguage  string    `json:"language,omitempty"`
-	AnnouncementID    string    `json:"announce,omitempty"`
-	Silent            bool      `json:"silent,omitempty"`
-	Protect           bool      `json:"protect,omitempty"`
-	AutoPin           bool      `json:"pin,omitempty"`
-	ShortenURLs       bool      `json:"short,omitempty"`
-	SplitText         bool      `json:"split,omitempty"`
+	V                int       `json:"v"`
+	Channels         []Channel `json:"channels,omitempty"`
+	Signature        string    `json:"signature,omitempty"`
+	SelectedLanguage string    `json:"language,omitempty"`
+	AnnouncementID   string    `json:"announce,omitempty"`
+	Silent           bool      `json:"silent,omitempty"`
+	Protect          bool      `json:"protect,omitempty"`
+	AutoPin          bool      `json:"pin,omitempty"`
+	ShortenURLs      bool      `json:"short,omitempty"`
+	SplitText        bool      `json:"split,omitempty"`
 }
 
 // ===================================================
@@ -312,7 +314,7 @@ func guardCallback(s *UserSession, cqID string) bool {
 }
 
 // ===================================================
-// Telegram API
+// Telegram API helper
 // ===================================================
 
 type tgEnvelope struct {
@@ -503,6 +505,13 @@ func handleMessage(m *Message) {
 	s := getSession(userID)
 	text := strings.TrimSpace(m.Text)
 
+	// ===== Channel admin commands (before private-chat logic) =====
+	if m.Chat.Type == "channel" && strings.HasPrefix(text, "/") {
+		if handleChannelCommand(m, text) {
+			return
+		}
+	}
+
 	if strings.HasPrefix(text, "/") {
 		fields := strings.Fields(text)
 		cmd := fields[0]
@@ -553,23 +562,21 @@ func handleMessage(m *Message) {
 			return
 		case "/import":
 			s.State = StateAwaitImport
-			sendMessage(userID, "📥 الصق رمز النسخة الاحتياطية (<code>BACKUP:v1:…</code>).", nil)
+			sendMessage(userID, "📥 الصق رمز النسخة (<code>BACKUP:v1:…</code>).", nil)
 			return
 		}
 	}
 
-	// Import state
 	if s.State == StateAwaitImport {
 		s.State = StateIdle
 		if importSession(userID, s, text) {
-			sendMessage(userID, "✅ تم استيراد الإعدادات بنجاح.", backKeyboard())
+			sendMessage(userID, "✅ تم الاستيراد.", backKeyboard())
 		} else {
-			sendMessage(userID, "⚠️ رمز النسخة غير صالح.", nil)
+			sendMessage(userID, "⚠️ الرمز غير صالح.", nil)
 		}
 		return
 	}
 
-	// State-driven text
 	switch s.State {
 	case StateAwaitChannelID:
 		handleAddChannelInput(userID, s, text)
@@ -577,12 +584,15 @@ func handleMessage(m *Message) {
 	case StateAwaitEditCaption:
 		if s.Draft == nil {
 			s.State = StateIdle
-			sendMessage(userID, "⚠️ لا يوجد منشور قيد التحرير.", nil)
+			sendMessage(userID, "⚠️ لا يوجد منشور.", nil)
 			return
 		}
 		s.Draft.Caption = markdownToHTML(text)
 		s.State = StateIdle
 		upsertPreview(userID, s)
+		sendMessage(userID,
+			"✅ تم تحديث النص.\n\n<i>هل تريد تنسيقاً (عريض، مائل…)؟ اضغط 🎨 تنسيق في المعاينة.</i>",
+			nil)
 		return
 	case StateAwaitButtonName:
 		s.PendingButtonName = cleanString(text)
@@ -628,7 +638,6 @@ func handleMessage(m *Message) {
 		return
 	}
 
-	// Media / text
 	if hasMedia(m) {
 		handleIncomingMedia(userID, s, m)
 		return
@@ -637,6 +646,134 @@ func handleMessage(m *Message) {
 		handleIncomingText(userID, s, m)
 	}
 }
+
+// ===================================================
+// Channel admin commands
+// ===================================================
+
+func handleChannelCommand(m *Message, text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := fields[0]
+	if i := strings.Index(cmd, "@"); i != -1 {
+		cmd = cmd[:i]
+	}
+
+	known := map[string]bool{
+		"/help": true, "/del": true, "/pin": true, "/unpin": true,
+		"/tr": true, "/react": true, "/info": true,
+	}
+	if !known[cmd] {
+		return false
+	}
+
+	chatID := m.Chat.ID
+
+	switch cmd {
+	case "/help":
+		helpText := "<b>📢 أوامر القناة</b>\n\n" +
+			"<b>بدون رد على رسالة:</b>\n" +
+			"• /info — معلومات القناة\n" +
+			"• /unpin — إلغاء تثبيت الرسالة الحالية\n" +
+			"• /help — هذه القائمة\n\n" +
+			"<b>بالرد على رسالة:</b>\n" +
+			"• /del — حذف الرسالة\n" +
+			"• /pin — تثبيت الرسالة\n" +
+			"• /tr — ترجمة إلى العربية\n" +
+			"• /react 👍 — إضافة تفاعل\n" +
+			"<i>مثال: /react 🔥</i>"
+		sendMessage(chatID, helpText, nil)
+		deleteMessage(chatID, m.MessageID)
+		return true
+	case "/info":
+		chat, err := getChat(strconv.FormatInt(chatID, 10))
+		if err != nil {
+			sendMessage(chatID, "❌ تعذر جلب المعلومات.", nil)
+			deleteMessage(chatID, m.MessageID)
+			return true
+		}
+		msg := fmt.Sprintf("<b>📢 معلومات القناة</b>\n\n🆔 <code>%d</code>\n📛 <b>%s</b>",
+			chat.ID, htmlEscape(chat.Title))
+		sendMessage(chatID, msg, nil)
+		deleteMessage(chatID, m.MessageID)
+		return true
+	case "/unpin":
+		if _, err := callTelegramAPI("unpinChatMessage", map[string]interface{}{
+			"chat_id": chatID,
+		}); err != nil {
+			log.Printf("unpinChatMessage: %v", err)
+		}
+		sendMessage(chatID, "📌 تم إلغاء التثبيت.", nil)
+		deleteMessage(chatID, m.MessageID)
+		return true
+	}
+
+	if m.ReplyToMessage == nil {
+		sendMessage(chatID, "⚠️ هذا الأمر يتطلب الرد على رسالة.", nil)
+		deleteMessage(chatID, m.MessageID)
+		return true
+	}
+	replyID := m.ReplyToMessage.MessageID
+
+	switch cmd {
+	case "/del":
+		deleteMessage(chatID, replyID)
+		deleteMessage(chatID, m.MessageID)
+	case "/pin":
+		pinChannelMessage(chatID, replyID)
+		deleteMessage(chatID, m.MessageID)
+	case "/tr":
+		var src string
+		if m.ReplyToMessage.Text != "" {
+			src = m.ReplyToMessage.Text
+		} else if m.ReplyToMessage.Caption != "" {
+			src = m.ReplyToMessage.Caption
+		}
+		if strings.TrimSpace(src) == "" {
+			sendMessage(chatID, "⚠️ لا يوجد نص للترجمة.", nil)
+			deleteMessage(chatID, m.MessageID)
+			return true
+		}
+		lang := detectLang(src)
+		translated := translateText(src, lang, "ar")
+		if strings.HasPrefix(translated, "تعذرت") || strings.HasPrefix(translated, "لا يوجد") {
+			sendMessage(chatID, "⚠️ "+translated, nil)
+		} else {
+			_, _ = callTelegramAPI("sendMessage", map[string]interface{}{
+				"chat_id":                  chatID,
+				"text":                     "🌐 <b>ترجمة:</b>\n\n" + htmlEscape(translated),
+				"parse_mode":               "HTML",
+				"reply_to_message_id":      replyID,
+				"disable_web_page_preview": true,
+			})
+		}
+		deleteMessage(chatID, m.MessageID)
+	case "/react":
+		emoji := "👍"
+		if len(fields) >= 2 {
+			emoji = fields[1]
+		}
+		_, err := callTelegramAPI("setMessageReaction", map[string]interface{}{
+			"chat_id":    chatID,
+			"message_id": replyID,
+			"reaction": []map[string]interface{}{
+				{"type": "emoji", "emoji": emoji},
+			},
+		})
+		if err != nil {
+			log.Printf("setMessageReaction: %v", err)
+			sendMessage(chatID, "⚠️ تعذر إضافة التفاعل.", nil)
+		}
+		deleteMessage(chatID, m.MessageID)
+	}
+	return true
+}
+
+// ===================================================
+// Media detection
+// ===================================================
 
 func hasMedia(m *Message) bool {
 	return len(m.Photo) > 0 || m.Video != nil || m.Voice != nil || m.Audio != nil ||
@@ -764,11 +901,11 @@ func previewKeyboard(s *UserSession) [][]map[string]interface{} {
 			btn("📢 قنوات", "preview_select_channels", "primary"),
 		},
 		{
-			btn("✏️ تعديل", "preview_edit_caption", "primary"),
-			btn("🌍 ترجمة", "preview_translate", "primary"),
+			btn("✏️ تعديل النص", "preview_edit_caption", "primary"),
+			btn("🎨 تنسيق", "preview_format", "primary"),
 		},
 		{
-			btn("🎨 تنسيق", "preview_format_hint", "primary"),
+			btn("🌍 ترجمة", "preview_translate", "primary"),
 			btn("🏷️ هاشتاقات", "preview_hashtags", "primary"),
 		},
 		{
@@ -789,9 +926,9 @@ func optionsKeyboard(s *UserSession) [][]map[string]interface{} {
 	if s.Silent {
 		silent = "🔕 صامت"
 	}
-	pin := "📍 تثبيت"
+	pin := "📍 بدون تثبيت"
 	if s.AutoPin {
-		pin = "📌 مُثبّت"
+		pin = "📌 تثبيت تلقائي"
 	}
 	protect := "🔓 غير محمي"
 	if s.Protect {
@@ -809,7 +946,7 @@ func optionsKeyboard(s *UserSession) [][]map[string]interface{} {
 		{btn(silent, "opt_silent", "primary"), btn(pin, "opt_pin", "primary")},
 		{btn(protect, "opt_protect", "primary"), btn(shorten, "opt_shorten", "primary")},
 		{btn(split, "opt_split", "primary")},
-		{btn("✅ تأكيد قبل النشر: " + onOff(s.ConfirmPublish), "opt_confirm", "primary")},
+		{btn("✅ تأكيد قبل النشر: "+onOff(s.ConfirmPublish), "opt_confirm", "primary")},
 		{btn("🏠 رجوع للمعاينة", "preview_back", "primary")},
 	}
 }
@@ -1050,6 +1187,104 @@ func markdownToHTML(s string) string {
 }
 
 // ===================================================
+// Format toggles
+// ===================================================
+
+func toggleWrap(caption, tag string) string {
+	openTag := "<" + tag + ">"
+	closeTag := "</" + tag + ">"
+	t := strings.TrimSpace(caption)
+	if strings.HasPrefix(t, openTag) && strings.HasSuffix(t, closeTag) {
+		return strings.TrimSuffix(strings.TrimPrefix(t, openTag), closeTag)
+	}
+	return openTag + t + closeTag
+}
+
+func stripAllFormat(caption string) string {
+	var b strings.Builder
+	inTag := false
+	for _, r := range caption {
+		if r == '<' {
+			inTag = true
+			continue
+		}
+		if r == '>' {
+			inTag = false
+			continue
+		}
+		if !inTag {
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	for strings.Contains(out, "\n\n\n") {
+		out = strings.ReplaceAll(out, "\n\n\n", "\n\n")
+	}
+	return strings.TrimSpace(out)
+}
+
+func applyFormat(s *UserSession, action string) {
+	if s.Draft == nil || s.Draft.Caption == "" {
+		return
+	}
+	switch action {
+	case "fmt_bold":
+		s.Draft.Caption = toggleWrap(s.Draft.Caption, "b")
+	case "fmt_italic":
+		s.Draft.Caption = toggleWrap(s.Draft.Caption, "i")
+	case "fmt_underline":
+		s.Draft.Caption = toggleWrap(s.Draft.Caption, "u")
+	case "fmt_strike":
+		s.Draft.Caption = toggleWrap(s.Draft.Caption, "s")
+	case "fmt_code":
+		s.Draft.Caption = toggleWrap(s.Draft.Caption, "code")
+	case "fmt_spoiler":
+		s.Draft.Caption = toggleWrap(s.Draft.Caption, "tg-spoiler")
+	case "fmt_quote":
+		s.Draft.Caption = toggleWrap(s.Draft.Caption, "blockquote")
+	case "fmt_clean":
+		s.Draft.Caption = cleanString(s.Draft.Caption)
+	case "fmt_upper":
+		s.Draft.Caption = strings.ToUpper(stripAllFormat(s.Draft.Caption))
+	case "fmt_lower":
+		s.Draft.Caption = strings.ToLower(stripAllFormat(s.Draft.Caption))
+	case "fmt_strip":
+		s.Draft.Caption = stripAllFormat(s.Draft.Caption)
+	}
+}
+
+func formatKeyboard() [][]map[string]interface{} {
+	return [][]map[string]interface{}{
+		{
+			btn("🅱️ عريض", "fmt_bold", "primary"),
+			btn("𝘐 مائل", "fmt_italic", "primary"),
+		},
+		{
+			btn("U̲ تحته خط", "fmt_underline", "primary"),
+			btn("S̶ يتوسطه", "fmt_strike", "primary"),
+		},
+		{
+			btn("</> كود", "fmt_code", "primary"),
+			btn("▒ إخفاء", "fmt_spoiler", "primary"),
+		},
+		{
+			btn("❝ اقتباس", "fmt_quote", "primary"),
+			btn("🧹 تنظيف", "fmt_clean", "primary"),
+		},
+		{
+			btn("🔠 UPPER", "fmt_upper", "primary"),
+			btn("🔡 lower", "fmt_lower", "primary"),
+		},
+		{
+			btn("♻️ إزالة كل التنسيق", "fmt_strip", "danger"),
+		},
+		{
+			btn("🔙 رجوع للمعاينة", "fmt_back", "primary"),
+		},
+	}
+}
+
+// ===================================================
 // URL shortener
 // ===================================================
 
@@ -1156,7 +1391,6 @@ func publishOne(channelID string, d *Draft, caption string, s *UserSession) ([]i
 	}
 
 	if len(d.Media) == 0 {
-		// text only
 		if s.SplitText && len([]rune(caption)) > 4000 {
 			return publishSplitText(channelID, caption, d.Buttons, opts)
 		}
@@ -1176,7 +1410,6 @@ func publishOne(channelID string, d *Draft, caption string, s *UserSession) ([]i
 		return []int{id}, nil
 	}
 
-	// multi: try group if all photos/videos, else individual
 	allGroupable := true
 	for _, it := range d.Media {
 		if it.Type != "photo" && it.Type != "video" {
@@ -1191,7 +1424,7 @@ func publishOne(channelID string, d *Draft, caption string, s *UserSession) ([]i
 		}
 		return []int{id}, nil
 	}
-	// fallback: publish individually
+
 	var ids []int
 	for i, item := range d.Media {
 		cap := ""
@@ -1204,10 +1437,7 @@ func publishOne(channelID string, d *Draft, caption string, s *UserSession) ([]i
 		}
 		ids = append(ids, id)
 	}
-	// send buttons separately
-	if len(d.Buttons) > 0 || true {
-		sendButtonsMarker(channelID, d.Buttons, opts, ids)
-	}
+	sendButtonsMarker(channelID, d.Buttons, opts, ids)
 	return ids, nil
 }
 
@@ -1277,7 +1507,6 @@ func publishSingleMedia(channelID string, item MediaItem, caption string, button
 	case "sticker":
 		method = "sendSticker"
 		payload["sticker"] = item.FileID
-		// stickers don't support keyboard; strip it
 		delete(payload, "reply_markup")
 	case "location":
 		method = "sendLocation"
@@ -1304,7 +1533,6 @@ func publishSingleMedia(channelID string, item MediaItem, caption string, button
 		return 0, fmt.Errorf("unsupported media type: %s", item.Type)
 	}
 
-	// Caption for media types that support it
 	if caption != "" {
 		switch item.Type {
 		case "photo", "video", "audio", "document", "animation", "voice":
@@ -1409,7 +1637,7 @@ func sendButtonsMarker(channelID string, extra []InlineButton, opts map[string]i
 	}
 }
 
-func pinChannelMessage(channelID string, msgID int) {
+func pinChannelMessage(channelID int64, msgID int) {
 	if msgID == 0 {
 		return
 	}
@@ -1448,11 +1676,10 @@ func userButtonsToInline(b []InlineButton) [][]map[string]interface{} {
 }
 
 // ===================================================
-// Announcement / Discussion Group
+// Announcement + Discussion group comments
 // ===================================================
 
 func sendAnnouncement(s *UserSession, results []PublishResult) {
-	// Announcement channel
 	if s.AnnouncementID != "" {
 		var lines []string
 		for _, r := range results {
@@ -1461,11 +1688,10 @@ func sendAnnouncement(s *UserSession, results []PublishResult) {
 			}
 		}
 		if len(lines) > 0 {
-			sendMessage(0, "", nil) // noop, kept to satisfy linters
 			payload := map[string]interface{}{
-				"chat_id":    s.AnnouncementID,
-				"text":       "📣 <b>منشور جديد</b>\n\n" + strings.Join(lines, "\n"),
-				"parse_mode": "HTML",
+				"chat_id":                  s.AnnouncementID,
+				"text":                     "📣 <b>منشور جديد</b>\n\n" + strings.Join(lines, "\n"),
+				"parse_mode":               "HTML",
 				"disable_web_page_preview": true,
 			}
 			if _, err := callTelegramAPI("sendMessage", payload); err != nil {
@@ -1474,7 +1700,6 @@ func sendAnnouncement(s *UserSession, results []PublishResult) {
 		}
 	}
 
-	// Discussion group comments (if channel has linked_chat_id)
 	for _, r := range results {
 		if !r.Success || r.Link == "" {
 			continue
@@ -1484,13 +1709,13 @@ func sendAnnouncement(s *UserSession, results []PublishResult) {
 			continue
 		}
 		payload := map[string]interface{}{
-			"chat_id":    chat.LinkedChatID,
-			"text":       fmt.Sprintf("🔗 <a href=\"%s\">رابط المنشور</a>", r.Link),
-			"parse_mode": "HTML",
+			"chat_id":                  chat.LinkedChatID,
+			"text":                     fmt.Sprintf("🔗 <a href=\"%s\">رابط المنشور</a>", r.Link),
+			"parse_mode":               "HTML",
 			"disable_web_page_preview": true,
 		}
 		if _, err := callTelegramAPI("sendMessage", payload); err != nil {
-			log.Printf("discussion comment to %d: %v", chat.LinkedChatID, err)
+			log.Printf("discussion comment: %v", err)
 		}
 	}
 }
@@ -1518,7 +1743,7 @@ func handleCallback(cq *CallbackQuery) {
 	}
 
 	switch {
-	// ---- main menus ----
+	// ---- menus ----
 	case data == "menu":
 		deleteMessage(chatID, cq.Message.MessageID)
 		showMainMenu(chatID, s)
@@ -1556,8 +1781,6 @@ func handleCallback(cq *CallbackQuery) {
 		deleteMessage(chatID, cq.Message.MessageID)
 		s.State = StateAwaitImport
 		sendMessage(chatID, "📥 الصق رمز النسخة (<code>BACKUP:v1:…</code>).", backKeyboard())
-	case data == "menu_ctx_help":
-		answerCallback(cq.ID, contextualHelp(data), true)
 
 	// ---- channels ----
 	case data == "ch_add":
@@ -1596,18 +1819,10 @@ func handleCallback(cq *CallbackQuery) {
 		s.LastPreviewMsgID = 0
 		s.State = StateAwaitEditCaption
 		sendMessage(chatID,
-			"✏️ أرسل النص الجديد.\n\n"+
-				"<b>تنسيقات مدعومة:</b>\n"+
-				"<code>**غامق**</code> → <b>غامق</b>\n"+
-				"<code>*مائل*</code> → <i>مائل</i>\n"+
-				"<code>__تحته خط__</code> → <u>تحته خط</u>\n"+
-				"<code>~~يتوسطه~~</code> → <s>يتوسطه</s>\n"+
-				"<code>`كود`</code> → <code>كود</code>\n"+
-				"<code>||إخفاء||</code> → <tg-spoiler>إخفاء</tg-spoiler>",
+			"✏️ <b>أرسل النص الجديد</b>\n\n"+
+				"• اكتب النص بأي شكل (عادي، عربي، إنجليزي…)\n"+
+				"• بعد الإرسال، اضغط زر <b>🎨 تنسيق</b> لتطبيق <b>عريض</b> أو <i>مائل</i> أو غيرها بضغطة واحدة.",
 			nil)
-	case data == "preview_format_hint":
-		answerCallback(cq.ID,
-			"**غامق**  *مائل*  __تحته خط__  ~~يتوسطه~~  `كود`  ||إخفاء||", true)
 	case data == "preview_translate":
 		deleteMessage(chatID, cq.Message.MessageID)
 		s.LastPreviewMsgID = 0
@@ -1638,6 +1853,31 @@ func handleCallback(cq *CallbackQuery) {
 	case data == "preview_options":
 		deleteMessage(chatID, cq.Message.MessageID)
 		sendMessage(chatID, "⚙️ <b>خيارات النشر</b>", optionsKeyboard(s))
+
+	// ---- format submenu ----
+	case data == "preview_format":
+		deleteMessage(chatID, cq.Message.MessageID)
+		if s.Draft == nil || s.Draft.Caption == "" {
+			answerCallback(cq.ID, "أرسل نصاً أولاً.", true)
+			return
+		}
+		sendMessage(chatID,
+			"🎨 <b>تنسيق النص</b>\n\n"+
+				"اختر التنسيق — يمكنك دمج أكثر من واحد بضغطات متتالية.\n"+
+				"<i>اضغط نفس الزر مرة أخرى لإلغاء التنسيق.</i>",
+			formatKeyboard())
+	case data == "fmt_back":
+		deleteMessage(chatID, cq.Message.MessageID)
+		s.LastPreviewMsgID = 0
+		upsertPreview(chatID, s)
+	case data == "fmt_bold" || data == "fmt_italic" || data == "fmt_underline" ||
+		data == "fmt_strike" || data == "fmt_code" || data == "fmt_spoiler" ||
+		data == "fmt_quote" || data == "fmt_clean" || data == "fmt_upper" ||
+		data == "fmt_lower" || data == "fmt_strip":
+		applyFormat(s, data)
+		_ = editMessageText(chatID, cq.Message.MessageID,
+			"🎨 <b>تنسيق النص</b>\n\n<i>آخر تحديث مُطبّق ✓</i>",
+			formatKeyboard())
 
 	// ---- options toggles ----
 	case data == "opt_silent":
@@ -1734,7 +1974,7 @@ func handleCallback(cq *CallbackQuery) {
 		}
 		upsertPreview(chatID, s)
 
-	// ---- announcement picker ----
+	// ---- announcement ----
 	case strings.HasPrefix(data, "ann_ch_"):
 		idx, _ := strconv.Atoi(strings.TrimPrefix(data, "ann_ch_"))
 		if idx < 0 || idx >= len(s.Channels) {
@@ -1757,18 +1997,6 @@ func refreshOptionsMessage(chatID int64, s *UserSession, msgID int) {
 }
 
 // ===================================================
-// Contextual help
-// ===================================================
-
-func contextualHelp(action string) string {
-	switch action {
-	case "menu_ctx_help":
-		return "اختر من القائمة العملية المطلوبة"
-	}
-	return "help"
-}
-
-// ===================================================
 // Hashtag suggestions UI
 // ===================================================
 
@@ -1779,7 +2007,7 @@ func showHashtagSuggestions(chatID int64, s *UserSession) {
 	}
 	tags := suggestHashtags(s.Draft.Caption)
 	if len(tags) == 0 {
-		sendMessage(chatID, "⚠️ لم أستطع استخراج كلمات مفتاحية.", nil)
+		sendMessage(chatID, "⚠️ لم أستخرج كلمات مفتاحية.", nil)
 		return
 	}
 	s.Draft.SuggestedTags = tags
@@ -2000,13 +2228,11 @@ func doPublish(chatID int64, s *UserSession, msgID int) {
 	s.PendingChannels = nil
 
 	deleteMessage(chatID, msgID)
-	answerCallbackStr := "⏳ جاري النشر…"
 
 	draft := s.Draft
 	results := publishToChannels(s, targets, draft)
 	clearDraft(s)
 
-	_ = answerCallbackStr
 	sendAnnouncement(s, results)
 
 	report := buildReport(results)
@@ -2076,7 +2302,7 @@ func showMainMenu(chatID int64, s *UserSession) {
 
 func showHelp(chatID int64) {
 	helpText := "<b>❓ المساعدة</b>\n\n" +
-		"<b>الأوامر:</b>\n" +
+		"<b>الأوامر (في الخاص):</b>\n" +
 		"• /start /menu — لوحة التحكم\n" +
 		"• /publish — بدء النشر\n" +
 		"• /channels — إدارة القنوات\n" +
@@ -2085,11 +2311,19 @@ func showHelp(chatID int64) {
 		"• /qr &lt;url&gt; — توليد QR\n" +
 		"• /export /import — نسخ احتياطي\n" +
 		"• /cancel — إلغاء\n\n" +
-		"<b>أنواع المحتوى المدعومة:</b>\n" +
+		"<b>أوامر القناة (يجب أن يكون البوت مشرفاً):</b>\n" +
+		"• /info — معلومات القناة\n" +
+		"• /help — أوامر القناة\n" +
+		"• /unpin — إلغاء تثبيت الرسالة الحالية\n" +
+		"• /del (بالرد) — حذف الرسالة\n" +
+		"• /pin (بالرد) — تثبيت الرسالة\n" +
+		"• /tr (بالرد) — ترجمة الرسالة\n" +
+		"• /react 👍 (بالرد) — إضافة تفاعل\n\n" +
+		"<b>أنواع المحتوى:</b>\n" +
 		"نص • صورة • فيديو • صوت • ملف • ملصق • موقع • جهة اتصال • استفتاء • ألبوم\n\n" +
-		"<b>التنسيق:</b> استخدم <code>**غامق**</code> و <code>*مائل*</code> و <code>`كود`</code> — سيُحوَّل تلقائياً.\n\n" +
+		"<b>التنسيق:</b> استخدم زر 🎨 تنسيق في المعاينة للأزرار السريعة.\n\n" +
 		"<b>Bulk Forward:</b> أعد توجيه أي منشور من قناة أخرى وسيُستقبل مباشرة.\n\n" +
-		"<b>Inline Mode:</b> في أي محادثة اكتب <code>@YourBotName نص</code>."
+		"<b>Inline Mode:</b> اكتب <code>@YourBotName نص</code> في أي محادثة."
 	sendMessage(chatID, helpText, backKeyboard())
 }
 
@@ -2227,7 +2461,7 @@ func exportSession(chatID int64, s *UserSession) {
 	encoded := base64.StdEncoding.EncodeToString(raw)
 	token := "BACKUP:v1:" + encoded
 	if len(token) > 3800 {
-		sendMessage(chatID, "⚠️ الإعدادات كبيرة جداً للتصدير.", nil)
+		sendMessage(chatID, "⚠️ الإعدادات كبيرة جداً.", nil)
 		return
 	}
 	sendMessage(chatID,
@@ -2330,7 +2564,7 @@ func handleInlineQuery(iq *InlineQuery) {
 		answerInlineQueryResults(iq.ID, []map[string]interface{}{
 			{
 				"type": "article", "id": "hint_" + iq.ID,
-				"title": "✏️ اكتب نصاً بعد اسم البوت",
+				"title":       "✏️ اكتب نصاً بعد اسم البوت",
 				"description": "مثال: @BotName مرحبا",
 				"input_message_content": map[string]interface{}{
 					"message_text": "اكتب نصاً بعد اسم البوت لترجمته.",
@@ -2347,7 +2581,7 @@ func handleInlineQuery(iq *InlineQuery) {
 		if lang == src {
 			results[i] = map[string]interface{}{
 				"type": "article", "id": fmt.Sprintf("inline_%s_%s", lang, iq.ID),
-				"title": flagEmoji(lang) + " " + langLabel(lang) + " (الأصلي)",
+				"title":       flagEmoji(lang) + " " + langLabel(lang) + " (الأصلي)",
 				"description": truncate(query, 100),
 				"input_message_content": map[string]interface{}{
 					"message_text": htmlEscape(query), "parse_mode": "HTML",
@@ -2365,7 +2599,7 @@ func handleInlineQuery(iq *InlineQuery) {
 			}
 			results[i] = map[string]interface{}{
 				"type": "article", "id": fmt.Sprintf("inline_%s_%s", lang, iq.ID),
-				"title": flagEmoji(lang) + " " + langLabel(lang),
+				"title":       flagEmoji(lang) + " " + langLabel(lang),
 				"description": truncate(tr, 100),
 				"input_message_content": map[string]interface{}{
 					"message_text": htmlEscape(tr), "parse_mode": "HTML",
