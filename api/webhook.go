@@ -3,7 +3,8 @@ package handler
 // ===================================================
 // Telegram Channel Publishing Manager
 // Single-file Vercel Serverless implementation
-// No database, no external persistence.
+// Fixes: translate button, album single-message, UX
+// Adds: inline query mode (translate to many langs)
 // ===================================================
 
 import (
@@ -16,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +31,7 @@ type Update struct {
 	UpdateID      int            `json:"update_id"`
 	Message       *Message       `json:"message"`
 	CallbackQuery *CallbackQuery `json:"callback_query"`
+	InlineQuery   *InlineQuery   `json:"inline_query"`
 }
 
 type User struct {
@@ -70,6 +71,13 @@ type CallbackQuery struct {
 	Data    string   `json:"data"`
 	Message *Message `json:"message"`
 	From    User     `json:"from"`
+}
+
+type InlineQuery struct {
+	ID     string `json:"id"`
+	From   User   `json:"from"`
+	Query  string `json:"query"`
+	Offset string `json:"offset"`
 }
 
 // ===================================================
@@ -129,13 +137,15 @@ type UserSession struct {
 	SelectedChannels  map[string]bool
 	SelectedLanguage  string
 	LastBotMessageID  int
-	LastMenuMessageID int
+	LastPreviewMsgID  int
+	LastMediaTime     time.Time
 	PendingButtonName string
 	Guard             map[string]time.Time
 }
 
 // ===================================================
-// In-memory state (Vercel warm instance only)
+// In-memory state
+// NOTE: on Vercel cold start this is lost. See notes.
 // ===================================================
 
 var (
@@ -160,8 +170,6 @@ func getSession(userID int64) *UserSession {
 	return s
 }
 
-// guardCallback prevents the same callback from being executed twice
-// within a short window. Returns true if it should be blocked.
 func guardCallback(s *UserSession, cqID string) bool {
 	if cqID == "" {
 		return false
@@ -240,7 +248,7 @@ func callTelegramAPI(method string, payload interface{}) (json.RawMessage, error
 }
 
 // ===================================================
-// Telegram action wrappers
+// Action wrappers
 // ===================================================
 
 func sendMessage(chatID int64, text string, keyboard [][]map[string]interface{}) int {
@@ -328,7 +336,6 @@ func getChat(channelID string) (*Chat, error) {
 // ===================================================
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Vercel may send GET for health checks
 	if r.Method == http.MethodGet {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -350,9 +357,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Always reply 200 quickly to Telegram
 	w.WriteHeader(http.StatusOK)
 
+	if update.InlineQuery != nil {
+		handleInlineQuery(update.InlineQuery)
+		return
+	}
 	if update.CallbackQuery != nil {
 		handleCallback(update.CallbackQuery)
 		return
@@ -378,7 +388,6 @@ func handleMessage(m *Message) {
 	// Commands
 	if strings.HasPrefix(text, "/") {
 		cmd := strings.Fields(text)[0]
-		// strip @BotName suffix
 		if idx := strings.Index(cmd, "@"); idx != -1 {
 			cmd = cmd[:idx]
 		}
@@ -424,7 +433,7 @@ func handleMessage(m *Message) {
 		}
 		s.Draft.Caption = cleanString(text)
 		s.State = StateIdle
-		showPreview(userID, s)
+		updatePreview(userID, s)
 		return
 	case StateAwaitButtonName:
 		s.PendingButtonName = cleanString(text)
@@ -450,11 +459,11 @@ func handleMessage(m *Message) {
 		})
 		s.PendingButtonName = ""
 		s.State = StateIdle
-		showPreview(userID, s)
+		updatePreview(userID, s)
 		return
 	}
 
-	// Media handling (photo / video / media group)
+	// Media
 	if len(m.Photo) > 0 || m.Video != nil {
 		handleIncomingMedia(userID, s, m)
 		return
@@ -468,13 +477,13 @@ func handleMessage(m *Message) {
 }
 
 // ===================================================
-// Incoming media
+// Media handling — ONE preview message, edit-in-place
 // ===================================================
 
 func handleIncomingMedia(userID int64, s *UserSession, m *Message) {
 	var item *MediaItem
 	if len(m.Photo) > 0 {
-		best := m.Photo[len(m.Photo)-1] // largest resolution
+		best := m.Photo[len(m.Photo)-1]
 		item = &MediaItem{Type: "photo", FileID: best.FileID}
 	} else if m.Video != nil {
 		item = &MediaItem{Type: "video", FileID: m.Video.FileID}
@@ -484,37 +493,50 @@ func handleIncomingMedia(userID int64, s *UserSession, m *Message) {
 	}
 
 	groupID := m.MediaGroupID
-	if s.Draft == nil || (groupID == "" && len(s.Draft.Media) > 0) || (groupID != "" && s.Draft.MediaGroupID != groupID) {
+	now := time.Now()
+
+	// Decide if this belongs to a new draft
+	newDraft := false
+	if s.Draft == nil {
+		newDraft = true
+	} else if groupID == "" && !s.LastMediaTime.IsZero() && now.Sub(s.LastMediaTime) > 3*time.Second {
+		// old single-media flow timed out → new draft
+		newDraft = true
+	} else if groupID != "" && s.Draft.MediaGroupID != "" && s.Draft.MediaGroupID != groupID {
+		newDraft = true
+	}
+
+	if newDraft {
 		clearDraft(s)
 		s.Draft = &Draft{MediaGroupID: groupID}
+	}
+	if s.Draft.MediaGroupID == "" && groupID != "" {
+		s.Draft.MediaGroupID = groupID
 	}
 	s.Draft.Media = append(s.Draft.Media, *item)
 	if m.Caption != "" && s.Draft.Caption == "" {
 		s.Draft.Caption = cleanString(m.Caption)
 	}
+	s.LastMediaTime = now
 
-	// In webhook mode, show the preview as soon as we have at least one item.
-	showPreview(userID, s)
+	// If we already sent a preview message → EDIT it. Otherwise send once.
+	if s.LastPreviewMsgID != 0 {
+		updatePreview(userID, s)
+	} else {
+		showPreview(userID, s)
+	}
 }
-
-// ===================================================
-// Incoming text (as content or as caption for existing media)
-// ===================================================
 
 func handleIncomingText(userID int64, s *UserSession, m *Message) {
 	clean := cleanString(m.Text)
 	if clean == "" {
 		return
 	}
-
 	if s.Draft != nil && len(s.Draft.Media) > 0 {
-		// treat as caption for pending media
 		s.Draft.Caption = clean
-		showPreview(userID, s)
+		updatePreview(userID, s)
 		return
 	}
-
-	// plain text post
 	if s.Draft == nil {
 		s.Draft = &Draft{}
 	}
@@ -523,13 +545,13 @@ func handleIncomingText(userID int64, s *UserSession, m *Message) {
 }
 
 // ===================================================
-// Preview & keyboard
+// Preview (single message pattern)
 // ===================================================
 
 func clearDraft(s *UserSession) {
-	if s.LastBotMessageID != 0 {
-		deleteMessage(s.UserID, s.LastBotMessageID)
-		s.LastBotMessageID = 0
+	if s.LastPreviewMsgID != 0 {
+		deleteMessage(s.UserID, s.LastPreviewMsgID)
+		s.LastPreviewMsgID = 0
 	}
 	s.Draft = nil
 	s.SelectedChannels = make(map[string]bool)
@@ -542,8 +564,26 @@ func showPreview(userID int64, s *UserSession) {
 		return
 	}
 	desc := describeDraft(s.Draft)
+	kb := previewKeyboard()
+	msgID := sendMessage(userID, desc, kb)
+	s.LastPreviewMsgID = msgID
+}
 
-	kb := [][]map[string]interface{}{
+func updatePreview(userID int64, s *UserSession) {
+	if s.Draft == nil {
+		return
+	}
+	if s.LastPreviewMsgID == 0 {
+		showPreview(userID, s)
+		return
+	}
+	desc := describeDraft(s.Draft)
+	kb := previewKeyboard()
+	editMessageText(userID, s.LastPreviewMsgID, desc, kb)
+}
+
+func previewKeyboard() [][]map[string]interface{} {
+	return [][]map[string]interface{}{
 		{
 			btn("🚀 نشر", "preview_publish", "success"),
 			btn("📢 اختيار القنوات", "preview_select_channels", "primary"),
@@ -553,15 +593,13 @@ func showPreview(userID int64, s *UserSession) {
 			btn("🌍 ترجمة", "preview_translate", "primary"),
 		},
 		{
-			btn("🔘 أزرار المنشور", "preview_buttons", "primary"),
+			btn("🔘 إضافة زر", "preview_buttons", "primary"),
 			btn("🗑 حذف الأزرار", "preview_clear_buttons", "danger"),
 		},
 		{
 			btn("❌ إلغاء", "preview_cancel", "danger"),
 		},
 	}
-	msgID := sendMessage(userID, desc, kb)
-	s.LastBotMessageID = msgID
 }
 
 func describeDraft(d *Draft) string {
@@ -598,7 +636,7 @@ func describeDraft(d *Draft) string {
 // Publishing
 // ===================================================
 
-func publishToChannels(userID int64, channels []Channel, d *Draft) []PublishResult {
+func publishToChannels(channels []Channel, d *Draft) []PublishResult {
 	results := make([]PublishResult, 0, len(channels))
 	for _, ch := range channels {
 		res := PublishResult{ChannelID: ch.ID, Title: ch.Title, Success: true}
@@ -607,11 +645,11 @@ func publishToChannels(userID int64, channels []Channel, d *Draft) []PublishResu
 		case len(d.Media) > 1:
 			err = publishMediaGroup(ch.ID, d)
 		case len(d.Media) == 1:
-			item := d.Media[0]
-			if item.Type == "photo" {
-				err = publishPhoto(ch.ID, item.FileID, d.Caption, d.Buttons)
+			it := d.Media[0]
+			if it.Type == "photo" {
+				err = publishPhoto(ch.ID, it.FileID, d.Caption, d.Buttons)
 			} else {
-				err = publishVideo(ch.ID, item.FileID, d.Caption, d.Buttons)
+				err = publishVideo(ch.ID, it.FileID, d.Caption, d.Buttons)
 			}
 		default:
 			err = publishText(ch.ID, d.Caption, d.Buttons)
@@ -628,7 +666,7 @@ func publishToChannels(userID int64, channels []Channel, d *Draft) []PublishResu
 
 func translateButtonKeyboard() [][]map[string]interface{} {
 	return [][]map[string]interface{}{
-		{btn("Translate", "translate", "primary")},
+		{btn("🌐 Translate", "translate", "primary")},
 	}
 }
 
@@ -642,7 +680,7 @@ func userButtonsToInline(b []InlineButton) [][]map[string]interface{} {
 			{"text": x.Text, "url": x.URL},
 		})
 	}
-	out = append(out, []map[string]interface{}{btn("Translate", "translate", "primary")})
+	out = append(out, []map[string]interface{}{btn("🌐 Translate", "translate", "primary")})
 	return out
 }
 
@@ -737,16 +775,21 @@ func handleCallback(cq *CallbackQuery) {
 		answerCallback(cq.ID, "", false)
 		return
 	}
+
 	data := cq.Data
 	chatID := cq.From.ID
 
-	// Translate button on a published post
+	// Attempt to recover draft from the callback message (session resilience)
+	recoverDraftFromMessage(s, cq.Message)
+
+	// Translate button on a published post (channel or private)
 	if data == "translate" {
 		handleInlineTranslate(cq)
 		return
 	}
 
 	switch {
+	// -------- main menu --------
 	case data == "menu":
 		deleteMessage(chatID, cq.Message.MessageID)
 		showMainMenu(chatID, s)
@@ -766,12 +809,26 @@ func handleCallback(cq *CallbackQuery) {
 	case data == "menu_languages":
 		deleteMessage(chatID, cq.Message.MessageID)
 		showLanguages(chatID)
+	case data == "menu_identity":
+		deleteMessage(chatID, cq.Message.MessageID)
+		me, _ := getChat(fmt.Sprintf("%d", chatID))
+		txt := fmt.Sprintf("🆔 <b>معرّفك:</b> <code>%d</code>", chatID)
+		if me != nil && me.Title != "" {
+			txt += fmt.Sprintf("\n📛 <b>الاسم:</b> %s", htmlEscape(me.Title))
+		}
+		sendMessage(chatID, txt, backKeyboard())
 
 	// -------- channels --------
 	case data == "ch_add":
 		deleteMessage(chatID, cq.Message.MessageID)
 		s.State = StateAwaitChannelID
-		sendMessage(chatID, "➕ أرسل معرف القناة:\n• عام: <code>@channel</code>\n• خاص: <code>-100xxxxxxxxxx</code>", nil)
+		sendMessage(chatID,
+			"➕ <b>إضافة قناة</b>\n\n"+
+				"أرسل معرف القناة:\n"+
+				"• عام: <code>@channel_username</code>\n"+
+				"• خاص: <code>-100xxxxxxxxxx</code>\n\n"+
+				"⚠️ يجب رفع البوت مشرفاً في القناة.",
+			backKeyboard())
 	case data == "ch_list":
 		deleteMessage(chatID, cq.Message.MessageID)
 		showChannelList(chatID, s)
@@ -788,7 +845,7 @@ func handleCallback(cq *CallbackQuery) {
 		idx, _ := strconv.Atoi(strings.TrimPrefix(data, "ch_refresh_"))
 		handleRefreshChannel(chatID, s, idx)
 
-	// -------- preview actions --------
+	// -------- preview --------
 	case data == "preview_publish":
 		deleteMessage(chatID, cq.Message.MessageID)
 		showChannelSelector(chatID, s)
@@ -811,17 +868,18 @@ func handleCallback(cq *CallbackQuery) {
 			s.Draft.Buttons = nil
 		}
 		deleteMessage(chatID, cq.Message.MessageID)
-		showPreview(chatID, s)
+		updatePreview(chatID, s)
 	case data == "preview_cancel":
 		clearDraft(s)
+		s.State = StateIdle
 		deleteMessage(chatID, cq.Message.MessageID)
 		sendMessage(chatID, "❌ تم إلغاء المنشور.", nil)
 		showMainMenu(chatID, s)
 
-	// -------- channel toggle / publish --------
+	// -------- channel selector --------
 	case strings.HasPrefix(data, "sel_"):
 		idx, _ := strconv.Atoi(strings.TrimPrefix(data, "sel_"))
-		toggleChannelSelection(chatID, s, idx)
+		toggleChannelSelection(s, idx)
 		refreshChannelSelectorMessage(chatID, s, cq.Message.MessageID)
 	case data == "pub_all":
 		for i := range s.Channels {
@@ -833,15 +891,18 @@ func handleCallback(cq *CallbackQuery) {
 		refreshChannelSelectorMessage(chatID, s, cq.Message.MessageID)
 	case data == "pub_confirm":
 		handleConfirmPublish(chatID, s, cq)
+	case data == "pub_back":
+		deleteMessage(chatID, cq.Message.MessageID)
+		showPreview(chatID, s)
 
-	// -------- language selection --------
+	// -------- languages (settings) --------
 	case strings.HasPrefix(data, "lang_"):
 		lang := strings.TrimPrefix(data, "lang_")
 		s.SelectedLanguage = lang
 		deleteMessage(chatID, cq.Message.MessageID)
-		sendMessage(chatID, fmt.Sprintf("✅ تم اختيار اللغة: <b>%s</b>", langLabel(lang)), nil)
+		sendMessage(chatID, fmt.Sprintf("✅ تم اختيار اللغة الافتراضية: <b>%s</b>", langLabel(lang)), backKeyboard())
 
-	// -------- translate target --------
+	// -------- translate target for preview --------
 	case strings.HasPrefix(data, "trg_"):
 		lang := strings.TrimPrefix(data, "trg_")
 		if s.Draft == nil || s.Draft.Caption == "" {
@@ -849,16 +910,42 @@ func handleCallback(cq *CallbackQuery) {
 			return
 		}
 		deleteMessage(chatID, cq.Message.MessageID)
-		translated := translateTo(s.Draft.Caption, lang)
-		if !strings.HasPrefix(translated, "تعذرت") && !strings.HasPrefix(translated, "لا يوجد") {
-			s.Draft.Caption = translated
-		} else {
+		src := detectLang(s.Draft.Caption)
+		translated := translateText(s.Draft.Caption, src, lang)
+		if strings.HasPrefix(translated, "تعذرت") || strings.HasPrefix(translated, "لا يوجد") {
 			sendMessage(chatID, "⚠️ "+translated, nil)
+		} else {
+			s.Draft.Caption = translated
 		}
-		showPreview(chatID, s)
+		updatePreview(chatID, s)
 	}
 
 	answerCallback(cq.ID, "", false)
+}
+
+// Recover draft from callback message when session was lost
+func recoverDraftFromMessage(s *UserSession, msg *Message) {
+	if s.Draft != nil {
+		return
+	}
+	if msg == nil {
+		return
+	}
+	if len(msg.Photo) > 0 {
+		s.Draft = &Draft{
+			Media: []MediaItem{{Type: "photo", FileID: msg.Photo[len(msg.Photo)-1].FileID}},
+		}
+		if msg.Caption != "" {
+			s.Draft.Caption = cleanString(msg.Caption)
+		}
+	} else if msg.Video != nil {
+		s.Draft = &Draft{
+			Media: []MediaItem{{Type: "video", FileID: msg.Video.FileID}},
+		}
+		if msg.Caption != "" {
+			s.Draft.Caption = cleanString(msg.Caption)
+		}
+	}
 }
 
 // ===================================================
@@ -882,7 +969,13 @@ func handleAddChannelInput(userID int64, s *UserSession, text string) {
 	chat, err := getChat(input)
 	if err != nil {
 		log.Printf("getChat(%s): %v", input, err)
-		sendMessage(userID, "⚠️ تعذر الوصول للقناة. تأكد أن البوت مشرف وأن المعرّف صحيح.", nil)
+		sendMessage(userID,
+			"⚠️ <b>تعذر الوصول للقناة!</b>\n\n"+
+				"تأكد من:\n"+
+				"• رفع البوت مشرفاً في القناة\n"+
+				"• كتابة المعرّف بشكل صحيح\n"+
+				"• أن القناة عامة أو أن البوت عضو فيها",
+			nil)
 		s.State = StateIdle
 		showChannelsMenu(userID, s)
 		return
@@ -894,7 +987,7 @@ func handleAddChannelInput(userID int64, s *UserSession, text string) {
 	s.Channels = append(s.Channels, Channel{ID: input, Title: title})
 	s.State = StateIdle
 	sendMessage(userID,
-		fmt.Sprintf("✅ تمت إضافة القناة:\n📢 <b>%s</b>\nID: <code>%s</code>",
+		fmt.Sprintf("✅ <b>تمت إضافة القناة بنجاح</b>\n\n📢 <b>%s</b>\n🆔 <code>%s</code>",
 			htmlEscape(title), htmlEscape(input)), nil)
 	showChannelsMenu(userID, s)
 }
@@ -947,13 +1040,19 @@ func refreshAllChannels(userID int64, s *UserSession) {
 }
 
 // ===================================================
-// Channel selector (multi-select)
+// Channel selector
 // ===================================================
 
 func showChannelSelector(chatID int64, s *UserSession) {
 	if len(s.Channels) == 0 {
-		sendMessage(chatID, "⚠️ لا توجد قنوات. أضف قناة أولاً من <b>إدارة القنوات</b>.", nil)
-		showMainMenu(chatID, s)
+		sendMessage(chatID,
+			"⚠️ <b>لا توجد قنوات مضافة!</b>\n\n"+
+				"انتقل إلى <b>إدارة القنوات</b> ثم اضغط ➕ إضافة قناة.\n\n"+
+				"<i>ملاحظة: على Vercel قد تُفقد قائمة القنوات عند إعادة تشغيل السيرفر. أعد إضافتها عند الحاجة.</i>",
+			[][]map[string]interface{}{
+				{btn("📢 إدارة القنوات", "menu_channels", "primary")},
+				{btn("🏠 القائمة الرئيسية", "menu", "primary")},
+			})
 		return
 	}
 	if s.Draft == nil {
@@ -974,16 +1073,28 @@ func refreshChannelSelectorMessage(chatID int64, s *UserSession, msgID int) {
 func buildChannelSelector(s *UserSession) (string, [][]map[string]interface{}) {
 	var b strings.Builder
 	b.WriteString("📢 <b>اختر القنوات المستهدفة</b>\n\n")
+	b.WriteString("يمكنك اختيار أكثر من قناة، ثم اضغط 🚀 نشر.\n\n")
+
 	var kb [][]map[string]interface{}
+
+	// Two channels per row for compactness
+	var row []map[string]interface{}
 	for i, ch := range s.Channels {
 		mark := "☐"
 		if s.SelectedChannels[ch.ID] {
 			mark = "☑"
 		}
-		kb = append(kb, []map[string]interface{}{
-			btn(fmt.Sprintf("%s %s", mark, ch.Title), fmt.Sprintf("sel_%d", i), "primary"),
-		})
+		label := fmt.Sprintf("%s %s", mark, truncate(ch.Title, 20))
+		row = append(row, btn(label, fmt.Sprintf("sel_%d", i), "primary"))
+		if len(row) == 2 {
+			kb = append(kb, row)
+			row = nil
+		}
 	}
+	if len(row) > 0 {
+		kb = append(kb, row)
+	}
+
 	kb = append(kb,
 		[]map[string]interface{}{
 			btn("✅ تحديد الكل", "pub_all", "primary"),
@@ -992,11 +1103,14 @@ func buildChannelSelector(s *UserSession) (string, [][]map[string]interface{}) {
 		[]map[string]interface{}{
 			btn("🚀 نشر في القنوات المحددة", "pub_confirm", "success"),
 		},
+		[]map[string]interface{}{
+			btn("🔙 رجوع للمعاينة", "pub_back", "primary"),
+		},
 	)
 	return b.String(), kb
 }
 
-func toggleChannelSelection(chatID int64, s *UserSession, idx int) {
+func toggleChannelSelection(s *UserSession, idx int) {
 	if idx < 0 || idx >= len(s.Channels) {
 		return
 	}
@@ -1025,7 +1139,7 @@ func handleConfirmPublish(chatID int64, s *UserSession, cq *CallbackQuery) {
 	}
 	deleteMessage(chatID, cq.Message.MessageID)
 
-	results := publishToChannels(chatID, targets, s.Draft)
+	results := publishToChannels(targets, s.Draft)
 	clearDraft(s)
 
 	report := buildReport(results)
@@ -1047,10 +1161,10 @@ func buildReport(results []PublishResult) string {
 	b.WriteString("🚀 <b>اكتمل النشر</b>\n\n")
 	fmt.Fprintf(&b, "✅ تم النشر: %d\n❌ فشل: %d\n\n", ok, fail)
 	if fail > 0 {
-		b.WriteString("<b>تفاصيل الأخطاء:</b>\n")
+		b.WriteString("<b>تفاصيل الأخطاء:</b>\n\n")
 		for _, r := range results {
 			if !r.Success {
-				fmt.Fprintf(&b, "📢 %s\n<code>%s</code>\n\n",
+				fmt.Fprintf(&b, "📢 <b>%s</b>\n<code>%s</code>\n\n",
 					htmlEscape(r.Title), htmlEscape(r.Err))
 			}
 		}
@@ -1062,6 +1176,12 @@ func buildReport(results []PublishResult) string {
 // Menus
 // ===================================================
 
+func backKeyboard() [][]map[string]interface{} {
+	return [][]map[string]interface{}{
+		{btn("🔙 رجوع", "menu", "primary")},
+	}
+}
+
 func showMainMenu(chatID int64, s *UserSession) {
 	kb := [][]map[string]interface{}{
 		{
@@ -1069,37 +1189,40 @@ func showMainMenu(chatID int64, s *UserSession) {
 			btn("📤 نشر", "menu_publish", "success"),
 		},
 		{
-			btn("🌍 ترجمة", "menu_languages", "primary"),
+			btn("🌍 الترجمة", "menu_languages", "primary"),
 			btn("⚙️ الإعدادات", "menu_settings", "primary"),
 		},
 		{
+			btn("🆔 معرّفي", "menu_identity", "primary"),
 			btn("❓ المساعدة", "menu_help", "primary"),
 		},
 	}
-	msgID := sendMessage(chatID,
-		"<b>لوحة التحكم الرئيسية</b>\nاختر العملية من القائمة أدناه:",
+	sendMessage(chatID,
+		"<b>🎛️ لوحة التحكم الرئيسية</b>\n\n"+
+			"اختر العملية من القائمة أدناه:",
 		kb)
-	s.LastMenuMessageID = msgID
 }
 
 func showHelp(chatID int64) {
 	helpText := "<b>❓ المساعدة</b>\n\n" +
-		"<b>الأوامر:</b>\n" +
-		"/start — لوحة التحكم\n" +
-		"/menu — القائمة الرئيسية\n" +
-		"/channels — إدارة القنوات\n" +
-		"/publish — بدء النشر\n" +
-		"/languages — لغات الترجمة\n" +
-		"/settings — الإعدادات\n" +
-		"/cancel — إلغاء العملية\n\n" +
-		"<b>طريقة الاستخدام:</b>\n" +
-		"1) أضف قناتك كمشرف للبوت.\n" +
-		"2) أرسل @username أو -100xxx لإضافتها.\n" +
-		"3) أرسل المحتوى (نص/صورة/فيديو/ألبوم).\n" +
-		"4) اختر القنوات ثم اضغط 🚀 نشر."
-	sendMessage(chatID, helpText, [][]map[string]interface{}{
-		{btn("🏠 القائمة الرئيسية", "menu", "primary")},
-	})
+		"<b>📋 الأوامر:</b>\n" +
+		"• /start — لوحة التحكم\n" +
+		"• /menu — القائمة الرئيسية\n" +
+		"• /channels — إدارة القنوات\n" +
+		"• /publish — بدء النشر\n" +
+		"• /languages — لغات الترجمة\n" +
+		"• /settings — الإعدادات\n" +
+		"• /cancel — إلغاء العملية\n\n" +
+		"<b>📌 طريقة الاستخدام:</b>\n" +
+		"1️⃣ أضف البوت مشرفاً في قناتك\n" +
+		"2️⃣ أضف القناة من \"إدارة القنوات\"\n" +
+		"3️⃣ أرسل المحتوى (نص/صورة/فيديو/ألبوم)\n" +
+		"4️⃣ اختر القنوات ثم اضغط 🚀 نشر\n\n" +
+		"<b>🌐 Inline Mode:</b>\n" +
+		"اكتب في أي مكان:\n" +
+		"<code>@YourBotName نص للترجمة</code>\n" +
+		"ستظهر لك قائمة باللغات المتاحة للترجمة."
+	sendMessage(chatID, helpText, backKeyboard())
 }
 
 func showChannelsMenu(chatID int64, s *UserSession) {
@@ -1112,49 +1235,50 @@ func showChannelsMenu(chatID int64, s *UserSession) {
 			btn("🗑 حذف قناة", "ch_delete_menu", "danger"),
 			btn("🔄 تحديث المعلومات", "ch_refresh", "primary"),
 		},
-		{
-			btn("🏠 القائمة الرئيسية", "menu", "primary"),
-		},
+		{btn("🏠 القائمة الرئيسية", "menu", "primary")},
 	}
-	sendMessage(chatID, "📢 <b>إدارة القنوات</b>", kb)
+	sendMessage(chatID, "📢 <b>إدارة القنوات</b>\n\nاختر العملية:", kb)
 }
 
 func showChannelList(chatID int64, s *UserSession) {
 	if len(s.Channels) == 0 {
-		sendMessage(chatID, "لا توجد قنوات مضافة.", nil)
+		sendMessage(chatID, "لا توجد قنوات مضافة.", backKeyboard())
 		return
 	}
 	var b strings.Builder
-	b.WriteString("📋 <b>قنواتك:</b>\n\n")
+	fmt.Fprintf(&b, "📋 <b>قنواتك (%d):</b>\n\n", len(s.Channels))
 	for i, ch := range s.Channels {
-		fmt.Fprintf(&b, "%d. 📢 <b>%s</b>\n   ID: <code>%s</code>\n", i+1, htmlEscape(ch.Title), htmlEscape(ch.ID))
+		fmt.Fprintf(&b, "%d. 📢 <b>%s</b>\n   🆔 <code>%s</code>\n\n",
+			i+1, htmlEscape(ch.Title), htmlEscape(ch.ID))
 	}
-	kb := [][]map[string]interface{}{{btn("🔙 رجوع", "menu_channels", "primary")}}
-	sendMessage(chatID, b.String(), kb)
+	sendMessage(chatID, b.String(), [][]map[string]interface{}{
+		{btn("🔙 رجوع", "menu_channels", "primary")},
+	})
 }
 
 func showDeleteChannelMenu(chatID int64, s *UserSession) {
 	if len(s.Channels) == 0 {
-		sendMessage(chatID, "لا توجد قنوات للحذف.", nil)
+		sendMessage(chatID, "لا توجد قنوات للحذف.", backKeyboard())
 		return
 	}
 	var kb [][]map[string]interface{}
 	for i, ch := range s.Channels {
 		kb = append(kb, []map[string]interface{}{
-			btn("🗑 "+ch.Title, fmt.Sprintf("ch_del_%d", i), "danger"),
+			btn("🗑 "+truncate(ch.Title, 30), fmt.Sprintf("ch_del_%d", i), "danger"),
 		})
 	}
 	kb = append(kb, []map[string]interface{}{btn("🔙 رجوع", "menu_channels", "primary")})
-	sendMessage(chatID, "اختر القناة التي تريد حذفها:", kb)
+	sendMessage(chatID, "🗑 <b>حذف قناة</b>\n\nاختر القناة:", kb)
 }
 
 func showSettings(chatID int64, s *UserSession) {
 	kb := [][]map[string]interface{}{
-		{btn("🌍 لغة الترجمة", "menu_languages", "primary")},
+		{btn("🌍 لغة الترجمة الافتراضية", "menu_languages", "primary")},
 		{btn("🏠 القائمة الرئيسية", "menu", "primary")},
 	}
 	sendMessage(chatID,
-		fmt.Sprintf("<b>⚙️ الإعدادات</b>\n\n🌍 اللغة الحالية: <b>%s</b>", langLabel(s.SelectedLanguage)),
+		fmt.Sprintf("<b>⚙️ الإعدادات</b>\n\n🌍 اللغة الافتراضية للترجمة: <b>%s</b>",
+			langLabel(s.SelectedLanguage)),
 		kb)
 }
 
@@ -1163,23 +1287,23 @@ func showLanguages(chatID int64) {
 		{btn("🇸🇦 العربية", "lang_ar", "primary"), btn("🇺🇸 English", "lang_en", "primary")},
 		{btn("🇹🇷 Türkçe", "lang_tr", "primary"), btn("🇫🇷 Français", "lang_fr", "primary")},
 		{btn("🇪🇸 Español", "lang_es", "primary"), btn("🇩🇪 Deutsch", "lang_de", "primary")},
-		{btn("🏠 القائمة الرئيسية", "menu", "primary")},
+		{btn("🔙 رجوع", "menu_settings", "primary")},
 	}
-	sendMessage(chatID, "🌍 اختر لغة الترجمة:", kb)
+	sendMessage(chatID, "🌍 <b>اختر اللغة الافتراضية للترجمة:</b>", kb)
 }
 
 func showTranslateMenu(chatID int64, s *UserSession) {
 	if s.Draft == nil || (s.Draft.Caption == "" && len(s.Draft.Media) == 0) {
-		sendMessage(chatID, "⚠️ لا يوجد محتوى للترجمة.", nil)
+		sendMessage(chatID, "⚠️ لا يوجد محتوى للترجمة.", backKeyboard())
 		return
 	}
 	kb := [][]map[string]interface{}{
 		{btn("🇸🇦 العربية", "trg_ar", "primary"), btn("🇺🇸 English", "trg_en", "primary")},
 		{btn("🇹🇷 Türkçe", "trg_tr", "primary"), btn("🇫🇷 Français", "trg_fr", "primary")},
 		{btn("🇪🇸 Español", "trg_es", "primary"), btn("🇩🇪 Deutsch", "trg_de", "primary")},
-		{btn("❌ إلغاء", "preview_publish", "danger")},
+		{btn("❌ إلغاء", "pub_back", "danger")},
 	}
-	sendMessage(chatID, "🌍 اختر اللغة التي تريد الترجمة إليها:", kb)
+	sendMessage(chatID, "🌍 <b>إلى أي لغة تريد الترجمة؟</b>", kb)
 }
 
 // ===================================================
@@ -1188,25 +1312,151 @@ func showTranslateMenu(chatID int64, s *UserSession) {
 
 func handleInlineTranslate(cq *CallbackQuery) {
 	var text string
-	if cq.Message != nil {
-		if cleanString(cq.Message.Caption) != "" {
-			text = cq.Message.Caption
-		} else if cleanString(cq.Message.Text) != "" {
-			text = cq.Message.Text
-		} else if cq.Message.ReplyToMessage != nil {
-			if cleanString(cq.Message.ReplyToMessage.Caption) != "" {
-				text = cq.Message.ReplyToMessage.Caption
-			} else if cleanString(cq.Message.ReplyToMessage.Text) != "" {
-				text = cq.Message.ReplyToMessage.Text
+	msg := cq.Message
+	if msg != nil {
+		if cleanString(msg.Caption) != "" {
+			text = msg.Caption
+		} else if cleanString(msg.Text) != "" {
+			text = msg.Text
+		} else if msg.ReplyToMessage != nil {
+			if cleanString(msg.ReplyToMessage.Caption) != "" {
+				text = msg.ReplyToMessage.Caption
+			} else if cleanString(msg.ReplyToMessage.Text) != "" {
+				text = msg.ReplyToMessage.Text
 			}
 		}
 	}
-	if text == "" {
+	if strings.TrimSpace(text) == "" {
 		answerCallback(cq.ID, "لا يوجد نص للترجمة.", true)
 		return
 	}
-	translated := translateTo(text, "ar")
-	answerCallback(cq.ID, translated, true)
+
+	src := detectLang(text)
+	dst := "ar"
+	if src == "ar" {
+		dst = "en"
+	}
+
+	translated := translateText(text, src, dst)
+	if strings.HasPrefix(translated, "تعذرت") || strings.HasPrefix(translated, "لا يوجد") {
+		answerCallback(cq.ID, translated, true)
+		return
+	}
+
+	// If short → show in alert. If long → send privately to user.
+	if len([]rune(translated)) <= 180 {
+		answerCallback(cq.ID, translated, true)
+		return
+	}
+	answerCallback(cq.ID, "✅ تم إرسال الترجمة في الخاص.", false)
+	sendMessage(cq.From.ID,
+		fmt.Sprintf("🌐 <b>ترجمة المنشور</b> (%s → %s):\n\n%s",
+			langLabel(src), langLabel(dst), htmlEscape(translated)),
+		nil)
+}
+
+// ===================================================
+// Inline Query mode
+// ===================================================
+
+func handleInlineQuery(iq *InlineQuery) {
+	query := cleanString(iq.Query)
+	if query == "" {
+		// Show hint result
+		results := []map[string]interface{}{
+			{
+				"type":        "article",
+				"id":          "hint_" + iq.ID,
+				"title":       "✏️ اكتب نصاً بعد اسم البوت",
+				"description": "مثال: @BotName مرحبا",
+				"input_message_content": map[string]interface{}{
+					"message_text": "اكتب نصاً بعد اسم البوت لترجمته.",
+				},
+			},
+		}
+		answerInlineQueryResults(iq.ID, results)
+		return
+	}
+
+	src := detectLang(query)
+	targets := []string{"ar", "en", "tr", "fr", "es", "de"}
+
+	results := make([]map[string]interface{}, len(targets))
+	var wg sync.WaitGroup
+	for i, lang := range targets {
+		if lang == src {
+			// Show original as one option
+			results[i] = map[string]interface{}{
+				"type":        "article",
+				"id":          fmt.Sprintf("inline_%s_%s", lang, iq.ID),
+				"title":       flagEmoji(lang) + " " + langLabel(lang) + " (النص الأصلي)",
+				"description": truncate(query, 100),
+				"input_message_content": map[string]interface{}{
+					"message_text": query,
+					"parse_mode":   "HTML",
+				},
+			}
+			continue
+		}
+		wg.Add(1)
+		go func(i int, lang string) {
+			defer wg.Done()
+			translated := translateText(query, src, lang)
+			if strings.HasPrefix(translated, "تعذرت") || strings.HasPrefix(translated, "لا يوجد") {
+				results[i] = nil
+				return
+			}
+			results[i] = map[string]interface{}{
+				"type":        "article",
+				"id":          fmt.Sprintf("inline_%s_%s", lang, iq.ID),
+				"title":       flagEmoji(lang) + " " + langLabel(lang),
+				"description": truncate(translated, 100),
+				"input_message_content": map[string]interface{}{
+					"message_text": htmlEscape(translated),
+					"parse_mode":   "HTML",
+				},
+			}
+		}(i, lang)
+	}
+	wg.Wait()
+
+	cleaned := make([]map[string]interface{}, 0, len(results))
+	for _, r := range results {
+		if r != nil {
+			cleaned = append(cleaned, r)
+		}
+	}
+	answerInlineQueryResults(iq.ID, cleaned)
+}
+
+func answerInlineQueryResults(iqID string, results []map[string]interface{}) {
+	payload := map[string]interface{}{
+		"inline_query_id": iqID,
+		"results":         results,
+		"cache_time":      30,
+		"is_personal":     true,
+	}
+	if _, err := callTelegramAPI("answerInlineQuery", payload); err != nil {
+		log.Printf("answerInlineQuery: %v", err)
+	}
+}
+
+func flagEmoji(lang string) string {
+	switch lang {
+	case "ar":
+		return "🇸🇦"
+	case "en":
+		return "🇺🇸"
+	case "tr":
+		return "🇹🇷"
+	case "fr":
+		return "🇫🇷"
+	case "es":
+		return "🇪🇸"
+	case "de":
+		return "🇩🇪"
+	}
+	return "🌐"
 }
 
 // ===================================================
@@ -1231,10 +1481,48 @@ func langLabel(code string) string {
 	return code
 }
 
-func translateTo(text, target string) string {
+// detectLang - rough but functional
+func detectLang(text string) string {
+	hasArabic := false
+	hasCyrillic := false
+	hasLatin := false
+	hasTurkish := false
+	for _, r := range text {
+		switch {
+		case r >= 0x0600 && r <= 0x06FF:
+			hasArabic = true
+		case r >= 0x0400 && r <= 0x04FF:
+			hasCyrillic = true
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+			hasLatin = true
+		case r == 'ı' || r == 'İ' || r == 'ş' || r == 'Ş' ||
+			r == 'ğ' || r == 'Ğ' || r == 'ç' || r == 'Ç' ||
+			r == 'ö' || r == 'Ö' || r == 'ü' || r == 'Ü':
+			hasTurkish = true
+		}
+	}
+	if hasArabic {
+		return "ar"
+	}
+	if hasTurkish {
+		return "tr"
+	}
+	if hasCyrillic {
+		return "en" // fallback (we don't support ru)
+	}
+	if hasLatin {
+		return "en"
+	}
+	return "en"
+}
+
+func translateText(text, src, dst string) string {
 	clean := cleanString(text)
 	if clean == "" {
 		return "لا يوجد نص محدد للترجمة."
+	}
+	if src == dst {
+		return clean
 	}
 	runes := []rune(clean)
 	if len(runes) > 490 {
@@ -1247,14 +1535,9 @@ func translateTo(text, target string) string {
 	}
 	apiKey := os.Getenv("TRANSLATION_API_KEY")
 
-	src := "en"
-	if target == "en" {
-		src = "ar"
-	}
-
 	q := url.Values{}
 	q.Set("q", clean)
-	q.Set("langpair", src+"|"+target)
+	q.Set("langpair", src+"|"+dst)
 	if apiKey != "" {
 		q.Set("key", apiKey)
 	}
@@ -1262,23 +1545,23 @@ func translateTo(text, target string) string {
 
 	req, err := http.NewRequest(http.MethodGet, full, nil)
 	if err != nil {
-		log.Printf("translateTo: new request: %v", err)
+		log.Printf("translateText: new request: %v", err)
 		return "تعذرت الترجمة حالياً."
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("translateTo: http: %v", err)
+		log.Printf("translateText: http: %v", err)
 		return "تعذرت الترجمة حالياً."
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("translateTo: read: %v", err)
+		log.Printf("translateText: read: %v", err)
 		return "تعذرت الترجمة حالياً."
 	}
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("translateTo: status %d: %s", resp.StatusCode, truncate(string(body), 200))
+		log.Printf("translateText: status %d: %s", resp.StatusCode, truncate(string(body), 200))
 		return "تعذرت الترجمة حالياً."
 	}
 
@@ -1289,7 +1572,7 @@ func translateTo(text, target string) string {
 		ResponseStatus interface{} `json:"responseStatus"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("translateTo: json: %v", err)
+		log.Printf("translateText: json: %v", err)
 		return "تعذرت ترجمة النص."
 	}
 	ok := false
@@ -1300,13 +1583,22 @@ func translateTo(text, target string) string {
 		ok = v == "200"
 	}
 	if !ok {
-		log.Printf("translateTo: non-200 status: %s", truncate(string(body), 200))
+		log.Printf("translateText: non-200 status: %s", truncate(string(body), 200))
 		return "تعذرت الترجمة (قد يكون الحد اليومي مستنفداً)."
 	}
 	if result.ResponseData.TranslatedText == "" {
 		return "تعذرت ترجمة النص."
 	}
 	return result.ResponseData.TranslatedText
+}
+
+// legacy wrapper (Arabic) — kept for compatibility
+func translateTo(text, target string) string {
+	src := detectLang(text)
+	if src == target {
+		src = "en"
+	}
+	return translateText(text, src, target)
 }
 
 // ===================================================
@@ -1361,11 +1653,3 @@ func truncate(s string, n int) string {
 	}
 	return string(r[:n]) + "..."
 }
-
-// sortChannels - helper احتياطي
-func sortChannels(chs []Channel) {
-	sort.Slice(chs, func(i, j int) bool { return chs[i].Title < chs[j].Title })
-}
-
-// silence unused warning for sortChannels in case it isn't used
-var _ = sortChannels
