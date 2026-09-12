@@ -68,6 +68,8 @@ type MediaItem struct {
 	FileID string `json:"file_id"`
 }
 
+// InputMedia هو الشكل المرسل فعلياً لتيليجرام ضمن sendMediaGroup.
+// أضفنا HasSpoiler لدعم خاصية تغبيش المحتوى لكل عنصر ضمن الألبوم.
 type InputMedia struct {
 	Type       string `json:"type"`
 	Media      string `json:"media"`
@@ -80,12 +82,17 @@ type Channel struct {
 	Title string `json:"title"`
 }
 
+// Draft يمثل مسودة النشر الحالية للمستخدم، ويحتفظ بكل الإعدادات المتقدمة
+// في الذاكرة فقط (بدون أي قاعدة بيانات) طوال مدة تحضير المنشور.
 type Draft struct {
 	Media            []MediaItem
 	MediaGroupID     string
 	Caption          string
 	LastBotMessageID int
 
+	// PendingInput يحدد أي خطوة إدخال نصي ننتظرها حالياً من المستخدم
+	// (مثلاً: "signature", "url_text", "url_url", "lang", "autodelete").
+	// قيمة فارغة تعني أنه لا يوجد إدخال منتظر.
 	PendingInput string
 
 	Signature          string
@@ -98,6 +105,9 @@ type Draft struct {
 	AutoDeleteDuration time.Duration
 }
 
+// PublishedPost يحتفظ بمعلومات كافية عن رسالة تم نشرها فعلاً في قناة،
+// لتمكين ميزات لاحقة (الترجمة بلغة محددة، وتحديث عدادات التفاعل)
+// دون الحاجة لأي تخزين خارجي.
 type PublishedPost struct {
 	TargetLang      string
 	HasTranslate    bool
@@ -108,15 +118,30 @@ type PublishedPost struct {
 }
 
 var (
-	userChannels   = make(map[int64][]Channel)
-	userDrafts     = make(map[int64]*Draft)
+	userChannels = make(map[int64][]Channel)
+	userDrafts   = make(map[int64]*Draft)
+
+	// publishedPosts مفتاحه "chatID_messageID" (chatID هنا هو معرف القناة الرقمي
+	// كما يعيده تيليجرام)، ويُستخدم لاسترجاع إعدادات الرسالة المنشورة لاحقاً
+	// عند الضغط على أزرار الترجمة أو التفاعل.
 	publishedPosts = make(map[string]*PublishedPost)
 
+	// عميل HTTP مشترك بمهلة زمنية محددة، يُستخدم في كل الطلبات الخارجية
 	httpClient = &http.Client{Timeout: 8 * time.Second}
+
 	reactionEmojis = []string{"👍", "👎", "❤️", "🔥"}
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
+	// طلب GET يُستخدم فقط للتحقق اليدوي من أن Vercel يستقبل الطلبات على هذا
+	// المسار (مفيد جداً عند تشخيص مشاكل ربط الـ webhook من المتصفح مباشرة).
+	if r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "✅ Telegram webhook endpoint is alive and reachable.")
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -140,25 +165,23 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		chatID := update.Message.Chat.ID
 		text := update.Message.Text
 
-		// 1. معالجة أمر البداية
 		if text == "/start" {
-			delete(userDrafts, chatID) // تنظيف أي مسودات عالقة
 			userName := "المستخدم"
 			if update.Message.From != nil && update.Message.From.FirstName != "" {
 				userName = update.Message.From.FirstName
 			}
 
-			welcomeMsg := fmt.Sprintf("مرحباً بك يا %s في بوت النشر والترجمة المتقدم\n\n"+
+			welcomeMsg := fmt.Sprintf("مرحباً بك يا %s في بوت النشر والترجمة\n\n"+
 				"1️⃣ قم برفع البوت كمشرف (Admin) في قناتك مع صلاحيات نشر الرسائل.\n"+
-				"2️⃣ أرسل معرف قناتك العامة مع ( الـ @) أو ايدي القناة الخاصة (-100xxxx) لإضافتها.\n"+
-				"3️⃣ أرسل أي نص، صورة، أو فيديو للبدء بتجهيز مسودة النشر مباشرة.", userName)
+				"2️⃣ أرسل معرف قناتك العامة مع ( الـ @) أو ايدي القناة الخاصة (-100xxxx) لإضافتها في البوت.\n"+
+				"3️⃣ يمكنك إرسال عدة قنوات وسيظهر لك البوت قائمة بأسمائها عند كل عملية نشر!\n"+
+				"4️⃣ يمكنك إرسال نصوص، صور، أو فيديوهات للنشر بشكل مباشر.", userName)
 
 			sendTelegramMessage(token, chatID, welcomeMsg, nil)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// 2. معالجة إضافة القنوات
 		if strings.HasPrefix(text, "@") || strings.HasPrefix(text, "-100") {
 			chTitle, err := fetchChannelTitle(token, text)
 			if err != nil {
@@ -171,7 +194,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 3. معالجة الوسائط (الصور والفيديو)
 		var currentMedia *MediaItem
 		if len(update.Message.Photo) > 0 {
 			photoID := update.Message.Photo[len(update.Message.Photo)-1].FileID
@@ -207,11 +229,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				draft.Media = append(draft.Media, *currentMedia)
 			}
+
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// 4. معالجة النصوص العادية
 		if text != "" {
 			draft, hasDraft := userDrafts[chatID]
 
@@ -220,12 +242,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				draft.LastBotMessageID = 0
 			}
 
+			// 1) إذا كنا ننتظر إدخالاً نصياً محدداً (توقيع، زر رابط، لغة، مدة حذف تلقائي)
 			if hasDraft && draft.PendingInput != "" {
 				handlePendingInput(token, chatID, draft, text)
 				w.WriteHeader(http.StatusOK)
 				return
 			}
 
+			// 2) إذا كانت هناك مسودة تحتوي وسائط بانتظار نص الكابشن الأول
 			if hasDraft && len(draft.Media) > 0 && draft.Caption == "" {
 				draft.Caption = text
 				askSettingsMenu(token, chatID, draft)
@@ -233,6 +257,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			// 3) لا توجد مسودة بعد -> نص عادي جديد للنشر
 			if !hasDraft {
 				userDrafts[chatID] = &Draft{Caption: text, TargetLang: "ar"}
 				askSettingsMenu(token, chatID, userDrafts[chatID])
@@ -240,6 +265,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			// 4) حالة نادرة: مسودة موجودة وكل شيء معبأ مسبقاً، نعيد عرض قائمة الإعدادات فقط
 			askSettingsMenu(token, chatID, draft)
 		}
 	}
@@ -247,6 +273,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handlePendingInput يعالج رسالة نصية عادية عندما تكون المسودة بانتظار
+// إدخال محدد (توقيع / نص زر رابط / رابط الزر / رمز اللغة / مدة الحذف التلقائي).
 func handlePendingInput(token string, chatID int64, draft *Draft, text string) {
 	switch draft.PendingInput {
 
@@ -312,6 +340,7 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 
 	if data == "translate" {
 		var textToTranslate string
+
 		if cleanString(cq.Message.Text) != "" {
 			textToTranslate = cq.Message.Text
 		} else if cleanString(cq.Message.Caption) != "" {
@@ -353,7 +382,10 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 		return
 	}
 
+	// من هذه النقطة فصاعداً، كل الأزرار تخص قوائم إعداد المسودة الخاصة بالبوت،
+	// لذا نحذف رسالة القائمة السابقة قبل المتابعة.
 	deleteTelegramMessage(token, chatID, cq.Message.MessageID)
+
 	draft, hasDraft := userDrafts[chatID]
 
 	if data == "action_skip_caption" {
@@ -430,7 +462,7 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 
 	case "set_autodelete":
 		draft.PendingInput = "autodelete"
-		msgID := sendTelegramMessage(token, chatID, "⏱️ أرسل عدد الدقائق لحذف المنشور تلقائياً (أرسل 0 لإلغاء الحذف التلقائي):", cancelPendingKeyboard())
+		msgID := sendTelegramMessage(token, chatID, "⏱️ أرسل عدد الدقائق لحذف المنشور تلقائياً من القناة بعد نشره (أرسل 0 لإلغاء الحذف التلقائي):", cancelPendingKeyboard())
 		draft.LastBotMessageID = msgID
 		answerCallback(token, cq.ID, "", false)
 		return
@@ -453,6 +485,7 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 		}
 
 		targetChannel := channels[idx]
+
 		var publishedIDs []int
 		var actualChatID int64
 
@@ -501,6 +534,7 @@ func handleCallbackQuery(token string, cq *CallbackQuery) {
 	}
 }
 
+// askSettingsMenu يعرض قائمة الإعدادات المتقدمة الكاملة للمسودة الحالية.
 func askSettingsMenu(token string, chatID int64, draft *Draft) {
 	summary := buildSettingsSummary(draft)
 
@@ -563,8 +597,9 @@ func askSelectChannel(token string, chatID int64, promptMsg string) {
 	channels := userChannels[chatID]
 	if len(channels) == 0 {
 		noChannelMsg := "⚠️ لم تقم بإضافة أي قناة بعد!\n\n" +
-			"يرجى إرسال معرف القناة العامة مع الـ (@) أولاً.\n" +
-			"واذا كانت قناتك خاصة ارسل ايدي القناة (-100xxxx)\n"
+			"يرجى إرسال معرف القناة العامة مع الـ (@) أولاً.\n\n" +
+			"وأذا كانت قناتك خاصة ارسل ايدي القناة (-100xxxx)\n" +
+			"اذا كانت قناتك خاصة استخدم هذا البوت @UsernameToId_roBot عبر الضغط على kanal وتحديد قناتك وأرسالها الى البوت"
 		sendTelegramMessage(token, chatID, noChannelMsg, nil)
 		return
 	}
@@ -610,6 +645,8 @@ func fetchChannelTitle(token, channelID string) (string, error) {
 	return result.Result.Title, nil
 }
 
+// buildInlineKeyboard يبني صفوف الأزرار النهائية لأي منشور (زر الترجمة، الزر
+// المخصص برابط خارجي، وصف أزرار التفاعل مع عرض العدادات إن وُجدت).
 func buildInlineKeyboard(includeTranslate bool, urlText, urlURL string, enableReactions bool, reactions map[string]int) [][]map[string]interface{} {
 	var rows [][]map[string]interface{}
 
@@ -646,6 +683,7 @@ func buildInlineKeyboard(includeTranslate bool, urlText, urlURL string, enableRe
 	return rows
 }
 
+// applySignature يلحق نص التوقيع (إن وُجد) بالنص أو الكابشن الأساسي.
 func applySignature(base, signature string) string {
 	if signature == "" {
 		return base
@@ -656,6 +694,8 @@ func applySignature(base, signature string) string {
 	return base + "\n\n" + signature
 }
 
+// registerPublishedPost يحفظ إعدادات المنشور المرتبطة برسالة معينة في قناة،
+// لاستخدامها لاحقاً عند الترجمة أو التفاعل مع المنشور.
 func registerPublishedPost(chatID int64, messageID int, draft *Draft, hasTranslate bool) {
 	if chatID == 0 || messageID == 0 {
 		return
@@ -683,6 +723,7 @@ type publishResult struct {
 
 func publishTextToChannel(token, channelID string, draft *Draft) (int, int64) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+
 	text := applySignature(draft.Caption, draft.Signature)
 
 	payload := map[string]interface{}{
@@ -699,6 +740,7 @@ func publishTextToChannel(token, channelID string, draft *Draft) (int, int64) {
 	jsonBody, _ := json.Marshal(payload)
 	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
+		log.Printf("publishTextToChannel: request error: %v", err)
 		return 0, 0
 	}
 	defer resp.Body.Close()
@@ -709,11 +751,13 @@ func publishTextToChannel(token, channelID string, draft *Draft) (int, int64) {
 	if res.Result.MessageID != 0 {
 		registerPublishedPost(res.Result.Chat.ID, res.Result.MessageID, draft, true)
 	}
+
 	return res.Result.MessageID, res.Result.Chat.ID
 }
 
 func publishPhotoToChannel(token, channelID, photoID string, draft *Draft) (int, int64) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", token)
+
 	caption := applySignature(draft.Caption, draft.Signature)
 
 	payload := map[string]interface{}{
@@ -734,6 +778,7 @@ func publishPhotoToChannel(token, channelID, photoID string, draft *Draft) (int,
 	jsonBody, _ := json.Marshal(payload)
 	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
+		log.Printf("publishPhotoToChannel: request error: %v", err)
 		return 0, 0
 	}
 	defer resp.Body.Close()
@@ -744,11 +789,13 @@ func publishPhotoToChannel(token, channelID, photoID string, draft *Draft) (int,
 	if res.Result.MessageID != 0 {
 		registerPublishedPost(res.Result.Chat.ID, res.Result.MessageID, draft, true)
 	}
+
 	return res.Result.MessageID, res.Result.Chat.ID
 }
 
 func publishVideoToChannel(token, channelID, videoID string, draft *Draft) (int, int64) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendVideo", token)
+
 	caption := applySignature(draft.Caption, draft.Signature)
 
 	payload := map[string]interface{}{
@@ -769,6 +816,7 @@ func publishVideoToChannel(token, channelID, videoID string, draft *Draft) (int,
 	jsonBody, _ := json.Marshal(payload)
 	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
+		log.Printf("publishVideoToChannel: request error: %v", err)
 		return 0, 0
 	}
 	defer resp.Body.Close()
@@ -779,11 +827,17 @@ func publishVideoToChannel(token, channelID, videoID string, draft *Draft) (int,
 	if res.Result.MessageID != 0 {
 		registerPublishedPost(res.Result.Chat.ID, res.Result.MessageID, draft, true)
 	}
+
 	return res.Result.MessageID, res.Result.Chat.ID
 }
 
+// publishMediaGroupToChannel ينشر ألبوم الوسائط، ثم يرسل رسالة متابعة تحمل
+// أزرار الترجمة/الرابط المخصص/التفاعل عند الحاجة (تيليجرام لا يسمح بأزرار
+// inline على عناصر sendMediaGroup مباشرة). يعيد كل معرفات الرسائل المنشورة
+// ومعرف القناة الرقمي الفعلي.
 func publishMediaGroupToChannel(token, channelID string, draft *Draft) ([]int, int64) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMediaGroup", token)
+
 	caption := applySignature(draft.Caption, draft.Signature)
 
 	var mediaList []InputMedia
@@ -812,6 +866,7 @@ func publishMediaGroupToChannel(token, channelID string, draft *Draft) ([]int, i
 	jsonBody, _ := json.Marshal(payload)
 	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
+		log.Printf("publishMediaGroupToChannel: request error: %v", err)
 		return nil, 0
 	}
 	defer resp.Body.Close()
@@ -859,8 +914,11 @@ func publishMediaGroupToChannel(token, channelID string, draft *Draft) ([]int, i
 				}
 				registerPublishedPost(chatID, btnRes.Result.MessageID, draft, caption != "")
 			}
+		} else {
+			log.Printf("publishMediaGroupToChannel: buttons message error: %v", err)
 		}
 	}
+
 	return ids, chatID
 }
 
@@ -943,6 +1001,14 @@ func cleanString(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// translateText يترجم النص المُعطى إلى لغة الهدف المحددة عبر MyMemory API.
+// تم إصلاح المشاكل التالية مقارنة بالنسخة السابقة:
+//  1. إضافة مهلة زمنية (timeout) للطلب حتى لا يتعلق ولا يفشل بصمت.
+//  2. اقتطاع النصوص الطويلة لأن MyMemory يرفض النصوص الأطول من ~500 حرف.
+//  3. التحقق الفعلي من responseStatus بدل الاكتفاء بوجود نص مُترجم،
+//     لأن MyMemory قد يعيد رسالة خطأ (تجاوز الحد اليومي) داخل translatedText نفسه.
+//  4. تسجيل الأخطاء عبر log.Printf بحيث تظهر في لوجز Vercel لتشخيص أي عطل لاحقاً.
+//  5. دعم لغة هدف قابلة للتخصيص لكل مسودة/منشور بدلاً من العربية فقط.
 func translateText(text, targetLang string) string {
 	clean := cleanString(text)
 	if clean == "" {
@@ -953,11 +1019,14 @@ func translateText(text, targetLang string) string {
 		targetLang = "ar"
 	}
 
+	// MyMemory يرفض/يقطع النصوص الطويلة، لذا نحدّها احتياطاً
 	runes := []rune(clean)
 	if len(runes) > 490 {
 		clean = string(runes[:490])
 	}
 
+	// ملاحظة: يمكن إضافة "&de=your-email@example.com" لرفع الحد اليومي
+	// من 5000 كلمة إلى ما يقارب 50000 كلمة لكل IP.
 	apiURL := fmt.Sprintf(
 		"https://api.mymemory.translated.net/get?q=%s&langpair=en|%s",
 		url.QueryEscape(clean),
@@ -966,12 +1035,19 @@ func translateText(text, targetLang string) string {
 
 	resp, err := httpClient.Get(apiURL)
 	if err != nil {
+		log.Printf("translateText: request error: %v", err)
 		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
+		log.Printf("translateText: read error: %v", err)
+		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("translateText: bad HTTP status %d, body: %s", resp.StatusCode, string(body))
 		return "تعذرت الترجمة حالياً، حاول مرة أخرى."
 	}
 
@@ -979,10 +1055,11 @@ func translateText(text, targetLang string) string {
 		ResponseData struct {
 			TranslatedText string `json:"translatedText"`
 		} `json:"responseData"`
-		ResponseStatus interface{} `json:"responseStatus"`
+		ResponseStatus interface{} `json:"responseStatus"` // قد يأتي كرقم أو كنص حسب حالة الرد
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("translateText: json unmarshal error: %v, body: %s", err, string(body))
 		return "تعذرت ترجمة النص."
 	}
 
@@ -994,9 +1071,14 @@ func translateText(text, targetLang string) string {
 		statusOK = v == "200"
 	}
 
-	if !statusOK || result.ResponseData.TranslatedText == "" {
-		return "تعذرت ترجمة النص."
+	if !statusOK {
+		log.Printf("translateText: mymemory returned non-200 status, body: %s", string(body))
+		return "تعذرت ترجمة النص (قد يكون تم تجاوز الحد المسموح للترجمة اليوم)."
 	}
 
-	return result.ResponseData.TranslatedText
+	if result.ResponseData.TranslatedText != "" {
+		return result.ResponseData.TranslatedText
+	}
+
+	return "تعذرت ترجمة النص."
 }
