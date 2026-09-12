@@ -1637,7 +1637,9 @@ func sendButtonsMarker(channelID string, extra []InlineButton, opts map[string]i
 	}
 }
 
-func pinChannelMessage(channelID int64, msgID int) {
+// pinChannelMessage works with both a numeric chat ID (int64) and a
+// channel username (string like "@name" or "-100..."). Telegram accepts both.
+func pinChannelMessage(channelID interface{}, msgID int) {
 	if msgID == 0 {
 		return
 	}
