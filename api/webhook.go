@@ -11,6 +11,8 @@ package handler
 //  • URL shortener / Split long text / Silent + Protect / Auto-pin
 //  • Announcement channel + Discussion group comments
 //  • Backup / Restore via /export & /import
+//  • Persistent sessions (Redis) — survive cold starts / multiple instances
+//  • Faster, cached translation with automatic provider fallback
 // ===================================================
 
 import (
@@ -267,28 +269,156 @@ type SessionBackup struct {
 }
 
 // ===================================================
-// In-memory state
+// In-memory state (per-warm-instance cache — see persistence section below)
 // ===================================================
 
 var (
 	sessionsMu sync.RWMutex
 	sessions   = make(map[int64]*UserSession)
 	httpClient = &http.Client{Timeout: 45 * time.Second}
+
+	// Dedicated, short-timeout clients so a slow external service
+	// (translation provider, Redis) can never hang a whole webhook call.
+	translateHTTPClient = &http.Client{Timeout: 7 * time.Second}
+	redisHTTPClient     = &http.Client{Timeout: 5 * time.Second}
 )
+
+// ===================================================
+// Persistent session storage (Upstash Redis REST API)
+//
+// The bot runs on a serverless platform, so the in-memory `sessions` map
+// above gets wiped whenever the runtime cold-starts or a request lands on a
+// different instance. That is what caused channels to "disappear" and
+// drafts to vanish mid-publish. To fix this, every session is mirrored to
+// Redis and reloaded automatically on a cache miss.
+//
+// Required environment variables (Upstash console → REST API tab):
+//   UPSTASH_REDIS_REST_URL
+//   UPSTASH_REDIS_REST_TOKEN
+//
+// If these are not set, the bot silently falls back to the old in-memory
+// only behavior (so it still runs, just without the fix).
+// ===================================================
+
+func sessionKey(userID int64) string {
+	return fmt.Sprintf("tgpub:session:%d", userID)
+}
+
+func redisConfigured() bool {
+	return os.Getenv("UPSTASH_REDIS_REST_URL") != "" && os.Getenv("UPSTASH_REDIS_REST_TOKEN") != ""
+}
+
+func redisRequest(method, path string, body io.Reader) ([]byte, error) {
+	base := strings.TrimRight(os.Getenv("UPSTASH_REDIS_REST_URL"), "/")
+	token := os.Getenv("UPSTASH_REDIS_REST_TOKEN")
+	if base == "" || token == "" {
+		return nil, errors.New("UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set")
+	}
+	req, err := http.NewRequest(method, base+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := redisHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("redis http %d: %s", resp.StatusCode, truncate(string(respBytes), 200))
+	}
+	return respBytes, nil
+}
+
+func redisGetString(key string) (string, bool, error) {
+	raw, err := redisRequest(http.MethodGet, "/get/"+url.PathEscape(key), nil)
+	if err != nil {
+		return "", false, err
+	}
+	var res struct {
+		Result *string `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return "", false, err
+	}
+	if res.Result == nil {
+		return "", false, nil
+	}
+	return *res.Result, true, nil
+}
+
+func redisSetString(key, value string) error {
+	_, err := redisRequest(http.MethodPost, "/set/"+url.PathEscape(key), bytes.NewBufferString(value))
+	return err
+}
+
+func newDefaultSession(userID int64) *UserSession {
+	return &UserSession{
+		UserID:           userID,
+		SelectedChannels: make(map[string]bool),
+		SelectedLanguage: "ar",
+		ConfirmPublish:   true,
+		SplitText:        true,
+		Guard:            make(map[string]time.Time),
+	}
+}
+
+func loadSessionFromStore(userID int64) *UserSession {
+	def := newDefaultSession(userID)
+	if !redisConfigured() {
+		return def
+	}
+	val, ok, err := redisGetString(sessionKey(userID))
+	if err != nil {
+		log.Printf("loadSessionFromStore(%d): %v", userID, err)
+		return def
+	}
+	if !ok || val == "" {
+		return def
+	}
+	var loaded UserSession
+	if err := json.Unmarshal([]byte(val), &loaded); err != nil {
+		log.Printf("loadSessionFromStore(%d): bad json: %v", userID, err)
+		return def
+	}
+	if loaded.SelectedChannels == nil {
+		loaded.SelectedChannels = make(map[string]bool)
+	}
+	if loaded.Guard == nil {
+		loaded.Guard = make(map[string]time.Time)
+	}
+	loaded.UserID = userID
+	return &loaded
+}
+
+// saveSession persists the full session (channels, settings, signature and
+// the in-progress draft) so it survives cold starts. Call it via `defer`
+// right after getSession() in every entry point that can mutate the
+// session, so it is saved no matter which return path is taken.
+func saveSession(s *UserSession) {
+	if !redisConfigured() {
+		return
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		log.Printf("saveSession(%d): marshal: %v", s.UserID, err)
+		return
+	}
+	if err := redisSetString(sessionKey(s.UserID), string(data)); err != nil {
+		log.Printf("saveSession(%d): %v", s.UserID, err)
+	}
+}
 
 func getSession(userID int64) *UserSession {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 	s := sessions[userID]
 	if s == nil {
-		s = &UserSession{
-			UserID:           userID,
-			SelectedChannels: make(map[string]bool),
-			SelectedLanguage: "ar",
-			ConfirmPublish:   true,
-			SplitText:        true,
-			Guard:            make(map[string]time.Time),
-		}
+		s = loadSessionFromStore(userID)
 		sessions[userID] = s
 	}
 	return s
@@ -503,6 +633,7 @@ func handleMessage(m *Message) {
 		userID = m.From.ID
 	}
 	s := getSession(userID)
+	defer saveSession(s)
 	text := strings.TrimSpace(m.Text)
 
 	// ===== Channel admin commands (before private-chat logic) =====
@@ -1732,6 +1863,7 @@ func handleCallback(cq *CallbackQuery) {
 		return
 	}
 	s := getSession(cq.From.ID)
+	defer saveSession(s)
 	if guardCallback(s, cq.ID) {
 		answerCallback(cq.ID, "", false)
 		return
@@ -2648,6 +2780,12 @@ func flagEmoji(lang string) string {
 
 // ===================================================
 // Translation
+//
+// Two providers are tried in order (Google's free endpoint first — it is
+// noticeably faster and more reliable than the old MyMemory-only setup —
+// then MyMemory as a fallback), each bounded by a short timeout, plus a
+// small in-process cache so repeated translations of the same text are
+// instant instead of hitting the network again.
 // ===================================================
 
 func langLabel(code string) string {
@@ -2694,6 +2832,42 @@ func detectLang(text string) string {
 	return "en"
 }
 
+var (
+	translateCacheMu sync.RWMutex
+	translateCache   = make(map[string]translateCacheEntry)
+)
+
+type translateCacheEntry struct {
+	text    string
+	expires time.Time
+}
+
+func translateCacheKey(text, src, dst string) string {
+	return src + "|" + dst + "|" + text
+}
+
+func getCachedTranslation(text, src, dst string) (string, bool) {
+	translateCacheMu.RLock()
+	defer translateCacheMu.RUnlock()
+	e, ok := translateCache[translateCacheKey(text, src, dst)]
+	if !ok || time.Now().After(e.expires) {
+		return "", false
+	}
+	return e.text, true
+}
+
+func setCachedTranslation(text, src, dst, result string) {
+	translateCacheMu.Lock()
+	defer translateCacheMu.Unlock()
+	if len(translateCache) > 500 {
+		// Cheap eviction: a proper LRU is overkill for a warm-instance cache.
+		translateCache = make(map[string]translateCacheEntry)
+	}
+	translateCache[translateCacheKey(text, src, dst)] = translateCacheEntry{
+		text: result, expires: time.Now().Add(6 * time.Hour),
+	}
+}
+
 func translateText(text, src, dst string) string {
 	clean := cleanString(text)
 	if clean == "" {
@@ -2706,29 +2880,101 @@ func translateText(text, src, dst string) string {
 	if len(runes) > 490 {
 		clean = string(runes[:490])
 	}
+
+	if cached, ok := getCachedTranslation(clean, src, dst); ok {
+		return cached
+	}
+
+	if result, ok := translateViaGoogle(clean, src, dst); ok {
+		setCachedTranslation(clean, src, dst, result)
+		return result
+	}
+	if result, ok := translateViaMyMemory(clean, src, dst); ok {
+		setCachedTranslation(clean, src, dst, result)
+		return result
+	}
+	return "تعذرت الترجمة."
+}
+
+// translateViaGoogle uses Google Translate's public (unofficial, free, no
+// key required) endpoint. It is the primary provider because it is
+// consistently faster than MyMemory and has no daily quota in practice.
+func translateViaGoogle(text, src, dst string) (string, bool) {
+	q := url.Values{}
+	q.Set("client", "gtx")
+	q.Set("sl", src)
+	q.Set("tl", dst)
+	q.Set("dt", "t")
+	q.Set("q", text)
+	req, err := http.NewRequest(http.MethodGet,
+		"https://translate.googleapis.com/translate_a/single?"+q.Encode(), nil)
+	if err != nil {
+		return "", false
+	}
+	resp, err := translateHTTPClient.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != 200 {
+		return "", false
+	}
+	// Response shape: [[["translated","original",null,null,1], ...], null, "src"]
+	var raw []interface{}
+	if err := json.Unmarshal(body, &raw); err != nil || len(raw) == 0 {
+		return "", false
+	}
+	segments, ok := raw[0].([]interface{})
+	if !ok {
+		return "", false
+	}
+	var b strings.Builder
+	for _, seg := range segments {
+		parts, ok := seg.([]interface{})
+		if !ok || len(parts) == 0 {
+			continue
+		}
+		piece, ok := parts[0].(string)
+		if !ok {
+			continue
+		}
+		b.WriteString(piece)
+	}
+	result := strings.TrimSpace(b.String())
+	if result == "" {
+		return "", false
+	}
+	return result, true
+}
+
+// translateViaMyMemory is the fallback provider (used only if Google's
+// endpoint fails or is unreachable), kept mainly for TRANSLATION_API_URL /
+// TRANSLATION_API_KEY compatibility with any existing setup.
+func translateViaMyMemory(text, src, dst string) (string, bool) {
 	baseURL := os.Getenv("TRANSLATION_API_URL")
 	if baseURL == "" {
 		baseURL = "https://api.mymemory.translated.net/get"
 	}
 	apiKey := os.Getenv("TRANSLATION_API_KEY")
 	q := url.Values{}
-	q.Set("q", clean)
+	q.Set("q", text)
 	q.Set("langpair", src+"|"+dst)
 	if apiKey != "" {
 		q.Set("key", apiKey)
 	}
 	req, err := http.NewRequest(http.MethodGet, baseURL+"?"+q.Encode(), nil)
 	if err != nil {
-		return "تعذرت الترجمة."
+		return "", false
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := translateHTTPClient.Do(req)
 	if err != nil {
-		return "تعذرت الترجمة."
+		return "", false
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "تعذرت الترجمة."
+		return "", false
 	}
 	var result struct {
 		ResponseData struct {
@@ -2737,7 +2983,7 @@ func translateText(text, src, dst string) string {
 		ResponseStatus interface{} `json:"responseStatus"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "تعذرت الترجمة."
+		return "", false
 	}
 	ok := false
 	switch v := result.ResponseStatus.(type) {
@@ -2746,13 +2992,10 @@ func translateText(text, src, dst string) string {
 	case string:
 		ok = v == "200"
 	}
-	if !ok {
-		return "تعذرت الترجمة."
+	if !ok || result.ResponseData.TranslatedText == "" {
+		return "", false
 	}
-	if result.ResponseData.TranslatedText == "" {
-		return "تعذرت الترجمة."
-	}
-	return result.ResponseData.TranslatedText
+	return result.ResponseData.TranslatedText, true
 }
 
 // ===================================================
